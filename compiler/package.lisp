@@ -116,6 +116,10 @@
   (:documentation "arm64 assembler for LAP.")
   (:use :cl))
 
+(defpackage :mezzano.lap.ppc64le
+  (:documentation "ppc64le assembler for LAP.")
+  (:use :cl))
+
 (defpackage :mezzano.compiler.codegen.arm64
   (:use :cl :mezzano.compiler)
   (:local-nicknames (:lap :mezzano.lap.arm64))
