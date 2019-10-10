@@ -407,11 +407,11 @@
   (x-form 31 rt ra rb 533))
 
 ;; store string word immediate
-(define-instruction stswi ()
+(define-instruction stswi (rs ra nb)
   (x-form 31 rs ra nb 725))
 
 ;; store string word indexed
-(define-instruction stswx ()
+(define-instruction stswx (rs ra rb)
   (x-form 31 rs ra rb 661))
 
 ;; add immediate
@@ -457,7 +457,7 @@
   (xo-form 31 rt ra rb 1 40 1))
 
 ;; add immediate carrying and record
-(define-instruction addic. ()
+(define-instruction addic. (rt ra si)
   (d-form 13 rt ra si))
 
 ;;; TODO all instrusctions after page 69
