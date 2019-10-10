@@ -16,7 +16,7 @@
   name)
 
 (defmacro define-instruction (name lambda-list &body body)
-  (let ((fname (intern (format nil "~s-assembler" name))))
+  (let ((fname (read-from-string (format nil "~s-assembler" name))))
     `(progn
        (defun ,fname ,lambda-list
          ,@body)
