@@ -5,6 +5,8 @@
 ;;;;
 ;;;; This file defines the standard class hierarchy.
 ;;;; It must only contain DEFCLASS forms.
+;;;;
+;;;; It is read in the MEZZANO.CLOS package.
 
 (defclass t () ()
   (:metaclass built-in-class))
@@ -23,7 +25,7 @@
   ((name :initarg :name)
    (lambda-list :initarg :lambda-list)
    (methods :initform ())
-   (method-class)
+   (method-class :initarg :method-class)
    (discriminating-function)
    (classes-to-emf-table :initform nil)
    (relevant-arguments)
@@ -31,13 +33,16 @@
    (method-combination :initarg :method-combination)
    (argument-precedence-order :initarg :argument-precedence-order)
    (argument-reordering-table :initform nil)
-   (declarations :initarg :declarations :initform nil)
+   ;; ### AMOP says :DECLARATIONS, spec says :DECLARE?
+   (declarations :initarg :declarations :initarg :declare :initform nil)
    (documentation :initform nil :initarg :documentation)
    (dependents :initform '()))
   (:default-initargs
    :name nil
    :lambda-list '()
-   :method-class 'standard-method
+   ;; The cold-generator can't deal with a call to FIND-CLASS here, use
+   ;; a direct reference instead.
+   :method-class *the-class-standard-method*
    :method-combination nil
    :argument-precedence-order '())
   (:metaclass funcallable-standard-class))
@@ -83,7 +88,8 @@
    (writers :initform '() :initarg :writers)))
 
 (defclass standard-effective-slot-definition (standard-slot-definition effective-slot-definition)
-  ((location :initarg :location)))
+  ((location :initarg :location)
+   (typecheck :initform nil :initarg :typecheck)))
 
 (defclass specializer (metaobject)
   ((direct-methods :initform ())))
@@ -109,7 +115,8 @@
    (dependents :initform '())
    (sealed :initform nil)
    (allocation-area :initform nil)
-   (constructor :initform nil))
+   (constructor :initform nil)
+   (documentation :initform nil :initarg :documentation))
   (:default-initargs :name nil))
 
 (defclass built-in-class (clos-class) ())
@@ -121,7 +128,8 @@
 (defclass funcallable-standard-class (std-class) ())
 
 (defclass structure-class (instance-class)
-  ((parent))
+  ((parent)
+   (has-standard-constructor))
   (:area :wired)
   (:sealed t))
 
@@ -148,14 +156,14 @@
 (defclass mezzano.delimited-continuations:delimited-continuation (function) () (:metaclass built-in-class))
 (defclass symbol (t) () (:metaclass built-in-class))
 (defclass character (t) () (:metaclass built-in-class))
-;; Streams are ordinary objects with no special representation,
-;; they don't need to be BUILT-IN-CLASSes.
-(defclass stream (t) ())
 (defclass sys.int::function-reference (t) () (:metaclass built-in-class))
 (defclass mezzano.runtime::symbol-value-cell (t) () (:metaclass built-in-class))
 (defclass sys.int::weak-pointer (t) () (:metaclass built-in-class))
+(defclass sys.int::weak-pointer-vector (t) () (:metaclass built-in-class))
 ;; FIXME: This doesn't quite work with large bytes.
 (defclass byte (t) () (:metaclass built-in-class))
+(defclass sys.int::instance-header (t) () (:metaclass built-in-class))
+(defclass sys.int::interrupt-frame (t) () (:metaclass built-in-class))
 
 (defclass sequence (t) () (:metaclass built-in-class))
 (defclass list (sequence) () (:metaclass built-in-class))

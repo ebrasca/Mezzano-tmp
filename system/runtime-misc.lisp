@@ -3,19 +3,32 @@
 
 (in-package :sys.int)
 
-(fmakunbound 'funcallable-instance-lambda-expression)
+;; Undefine the following functions if they're not generic functions.
+;; They have early non-generic definitions that these generics overwrite.
+;; Undefining them beforehand prevents problems with redefinition.
+
+(when (and (fboundp 'funcallable-instance-lambda-expression)
+           (not (typep (fdefinition 'funcallable-instance-lambda-expression)
+                       'standard-generic-function)))
+  (fmakunbound 'funcallable-instance-lambda-expression))
 (defgeneric funcallable-instance-lambda-expression (function)
   (:method ((function function))
     (declare (ignore function))
     (values nil t nil)))
 
-(fmakunbound 'funcallable-instance-debug-info)
+(when (and (fboundp 'funcallable-instance-debug-info)
+           (not (typep (fdefinition 'funcallable-instance-debug-info)
+                       'standard-generic-function)))
+  (fmakunbound 'funcallable-instance-debug-info))
 (defgeneric funcallable-instance-debug-info (function)
   (:method ((function function))
     (declare (ignore function))
     nil))
 
-(fmakunbound 'funcallable-instance-compiled-function-p)
+(when (and (fboundp 'funcallable-instance-compiled-function-p)
+           (not (typep (fdefinition 'funcallable-instance-compiled-function-p)
+                       'standard-generic-function)))
+  (fmakunbound 'funcallable-instance-compiled-function-p))
 (defgeneric funcallable-instance-compiled-function-p (function)
   (:method ((function function))
     (declare (ignore function))
@@ -23,8 +36,7 @@
 
 (defmethod print-object ((object structure-object) stream)
   (write-string "#S" stream)
-  (let ((contents (list (type-of object)))
-        (class (class-of object)))
+  (let ((class (class-of object)))
     (write (list* (class-name class)
                   (loop
                      for slot in (mezzano.clos:class-slots class)
@@ -49,7 +61,9 @@
 
 (defmethod print-object ((object mezzano.supervisor:thread) stream)
   (print-unreadable-object (object stream :type t :identity t)
-    (format stream "~S" (mezzano.supervisor:thread-name object))))
+    (format stream "~S ~S"
+            (mezzano.supervisor:thread-name object)
+            (mezzano.supervisor:thread-state object))))
 
 (defmethod print-object ((object mezzano.supervisor::disk) stream)
   (print-unreadable-object (object stream :identity t)
@@ -104,6 +118,19 @@
             (t
              (format stream "dead"))))))
 
+(defmethod print-object ((o weak-pointer-vector) stream)
+  (print-unreadable-object (o stream :identity t :type t)
+    (let ((entries (loop
+                      for i below (weak-pointer-vector-length o)
+                      collect (multiple-value-bind (key value livep)
+                                  (weak-pointer-vector-pair o i)
+                                (if livep
+                                    (if (and key (eql key value))
+                                        key
+                                        (cons key value))
+                                    nil)))))
+      (format stream "~:S" entries))))
+
 (defmethod print-object ((o byte) stream)
   (print-unreadable-object (o stream :type t)
     (format stream ":Size ~D :Position ~D"
@@ -143,7 +170,7 @@
 (defmethod print-object ((object array) stream)
   (cond (*print-array*
          (write-char #\# stream)
-         (write (array-rank object) :stream stream :base 10)
+         (write (array-rank object) :stream stream :base 10 :radix nil)
          (write-char #\A stream)
          (labels ((print-level (dims index)
                     (cond ((null dims)
@@ -165,9 +192,16 @@
   (print-unreadable-object (object stream :identity t :type t)
     (format stream "~A" (mezzano.supervisor::irq-platform-number object))))
 
-(defmethod print-object ((object mezzano.supervisor::wfo) stream)
+(defmethod print-object ((object mezzano.supervisor:watcher) stream)
   (print-unreadable-object (object stream :identity t :type t)
-    (format stream "~:A" (mezzano.supervisor::wfo-objects object))))
+    (let ((name (mezzano.supervisor:watcher-name object)))
+      (if name
+          (format stream "~A ~:A" name (mezzano.supervisor:watcher-objects object))
+          (format stream "~:A" (mezzano.supervisor:watcher-objects object))))))
+
+(defmethod print-object ((o instance-header) stream)
+  (print-unreadable-object (o stream :type t)
+    (format stream "for ~S" (mezzano.runtime::%unpack-instance-header o))))
 
 (defun snapshot-and-exit ()
   "Terminate the current thread and take a snapshot.
@@ -242,3 +276,16 @@ The file will only be recompiled if the source is newer than the output file, or
              (defconstant-uneql-name condition)
              (defconstant-uneql-old-value condition)
              (defconstant-uneql-new-value condition)))))
+
+(deftype radix () '(integer 2 36))
+(declaim (type radix *read-base*))
+(declaim (type (member short-float single-float double-float long-float)
+               *read-default-float-format*))
+(declaim (type radix *print-base*))
+(declaim (type (member :upcase :downcase :capitalize) *print-case*))
+(declaim (type (or null (integer 0))
+               *print-length*
+               *print-level*
+               *print-lines*
+               *print-miser-width*
+               *print-right-margin*))

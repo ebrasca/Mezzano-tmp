@@ -64,6 +64,7 @@
   (let ((remote-address (sys.net:resolve-address remote-host)))
     (multiple-value-bind (host interface)
         (mezzano.network.ip:ipv4-route remote-address)
+      (declare (ignore host))
       (let* ((source-port (allocate-local-udp-port))
              (source-address (mezzano.network.ip:ipv4-interface-address interface))
              (connection (make-instance 'udp4-connection
@@ -80,13 +81,13 @@
     (setf *udp-connections* (remove connection *udp-connections*))
     (setf *allocated-udp-ports* (remove (local-port connection) *allocated-udp-ports*))))
 
-(defmethod send (sequence (connection udp4-connection) &optional (start 0) end)
+(defmethod send (sequence (connection udp4-connection) &key (start 0) end)
   (let* ((source (local-address connection))
          (source-port (local-port connection))
          (destination (remote-address connection))
          (destination-port (remote-port connection))
          (header (make-array 8 :element-type '(unsigned-byte 8)))
-         (packet (list header sequence)))
+         (packet (list header (subseq sequence start end))))
     (setf (ub16ref/be header 0) source-port
           (ub16ref/be header 2) destination-port
           (ub16ref/be header 4) (sys.net:packet-length packet)
@@ -95,44 +96,41 @@
                                              mezzano.network.ip:+ip-protocol-udp+
                                              packet)))
 
-(defmethod receive ((connection udp4-connection) &optional timeout)
-  (cond ((not timeout)
-         ;; Wait forever.
-         (with-udp-connection-locked (connection)
-           (loop
-              (when (udp-connection-packets connection)
-                (return (pop (udp-connection-packets connection))))
-              (mezzano.supervisor:condition-wait (udp-connection-cvar connection)
-                                                 (udp-connection-lock connection)))))
-        ((zerop timeout)
-         ;; Don't wait.
-         (with-udp-connection-locked (connection)
-           (when (udp-connection-packets connection)
-             (pop (udp-connection-packets connection)))))
-        (t
-         ;; Wait for some time.
-         (let ((timeout-absolute (+ (get-universal-time) timeout)))
-           (loop
-              (with-udp-connection-locked (connection)
-                (when (udp-connection-packets connection)
-                  (return (pop (udp-connection-packets connection)))))
-              (when (> (get-universal-time) timeout-absolute)
-                (return nil))
-              (sleep 0.01))))))
+(defmethod receive ((connection udp4-connection) &key timeout)
+  (with-udp-connection-locked (connection)
+    (mezzano.supervisor:condition-wait-for ((udp-connection-cvar connection)
+                                            (udp-connection-lock connection)
+                                            timeout)
+      (pop (udp-connection-packets connection)))))
 
-(defun %udp4-receive (packet local-ip remote-ip start end)
+(defmethod mezzano.network.ip:ipv4-receive ((protocol (eql mezzano.network.ip:+ip-protocol-udp+)) packet local-ip remote-ip start end)
   (let* ((remote-port (ub16ref/be packet start))
          (local-port (ub16ref/be packet (+ start 2)))
          (length (ub16ref/be packet (+ start 4)))
          (checksum (ub16ref/be packet (+ start 6)))
          (connection (get-udp-connection remote-ip remote-port local-ip local-port)))
-    (cond
-      (connection
-       (with-udp-connection-locked (connection)
-         (let ((payload (make-array (- end (+ start 8)) :displaced-to packet :displaced-index-offset (+ start 8))))
-           ;; Send data to the user layer
-           (setf (udp-connection-packets connection) (append (udp-connection-packets connection)
-                                                             (list payload)))
-           (mezzano.supervisor:condition-notify (udp-connection-cvar connection) t))))
-      (t (format t "Ignoring UDP4 packet from ~X ~S~%" remote-ip
-                 (subseq packet start end))))))
+    (when connection
+      (with-udp-connection-locked (connection)
+        (let ((payload (make-array (- end (+ start 8)) :displaced-to packet :displaced-index-offset (+ start 8))))
+          ;; Send data to the user layer
+          (setf (udp-connection-packets connection) (append (udp-connection-packets connection)
+                                                            (list payload)))
+          (mezzano.supervisor:condition-notify (udp-connection-cvar connection) t))))))
+
+(defmethod mezzano.network:local-endpoint ((object udp4-connection))
+  (values (local-address object)
+          (local-port object)))
+
+(defmethod mezzano.network:remote-endpoint ((object udp4-connection))
+  (values (remote-address object)
+          (remote-port object)))
+
+(defmethod print-object ((instance udp4-connection) stream)
+  (print-unreadable-object (instance stream :type t :identity t)
+    (multiple-value-bind (local-address local-port)
+        (mezzano.network:local-endpoint instance)
+      (multiple-value-bind (remote-address remote-port)
+          (mezzano.network:remote-endpoint instance)
+        (format stream ":Local ~A:~A :Remote ~A:~A"
+                local-address local-port
+                remote-address remote-port)))))

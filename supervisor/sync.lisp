@@ -5,10 +5,55 @@
 
 (in-package :mezzano.supervisor)
 
+;;; Thread pool support for hijacking blocking functions.
+;;; When the current thread's thread-pool slot is non-nil, the blocking
+;;; functions will call THREAD-POOL-BLOCK with the thread pool, the name
+;;; of the function and supplied arguments instead of actually blocking.
+;;; The thread's thread-pool slot will be set to NIL for the duration
+;;; of the call to THREAD-POOL-BLOCK.
+
+(defmacro thread-pool-blocking-hijack (function-name &rest arguments)
+  (let ((self (gensym "SELF"))
+        (pool (gensym "POOL")))
+    `(let* ((,self (current-thread))
+            (,pool (thread-thread-pool ,self)))
+       (when ,pool
+         (unwind-protect
+              (progn
+                (setf (thread-thread-pool ,self) nil)
+                (return-from ,function-name
+                  (thread-pool-block ,pool ',function-name ,@arguments)))
+           (setf (thread-thread-pool ,self) ,pool))))))
+
+(defmacro thread-pool-blocking-hijack-apply (function-name &rest arguments)
+  (let ((self (gensym "SELF"))
+        (pool (gensym "POOL")))
+    `(let* ((,self (current-thread))
+            (,pool (thread-thread-pool ,self)))
+       (when ,pool
+         (unwind-protect
+              (progn
+                (setf (thread-thread-pool ,self) nil)
+                (return-from ,function-name
+                  (apply #'thread-pool-block ,pool ',function-name ,@arguments)))
+           (setf (thread-thread-pool ,self) ,pool))))))
+
+(defmacro inhibit-thread-pool-blocking-hijack (&body body)
+  "Run body with the thread's thread-pool unset."
+  (let ((self (gensym "SELF"))
+        (pool (gensym "POOL")))
+    `(let* ((,self (current-thread))
+            (,pool (thread-thread-pool ,self)))
+       (unwind-protect
+            (progn
+              (setf (thread-thread-pool ,self) nil)
+              ,@body)
+         (setf (thread-thread-pool ,self) ,pool)))))
+
 ;;; Common structure for sleepable things.
 (defstruct (wait-queue
              (:area :wired))
-  (name nil :read-only t)
+  (name nil)
   (%lock (place-spinlock-initializer))
   (head nil)
   (tail nil))
@@ -64,6 +109,7 @@
   (contested-count 0))
 
 (defun acquire-mutex (mutex &optional (wait-p t))
+  (check-type mutex mutex)
   (let ((self (current-thread)))
     ;; Fast path - try to lock.
     (when (eql (sys.int::cas (mutex-state mutex) :unlocked :locked) :unlocked)
@@ -84,6 +130,7 @@
       (ensure-interrupts-enabled)
       (unless (not *pseudo-atomic*)
         (panic "Trying to acquire mutex " mutex " while pseudo-atomic."))
+      (thread-pool-blocking-hijack acquire-mutex mutex wait-p)
       (%call-on-wired-stack-without-interrupts
        #'acquire-mutex-slow-path nil mutex self)
       t)))
@@ -136,6 +183,7 @@
                       :format-arguments (list mutex (mutex-name mutex) current-owner)))))))
 
 (defun release-mutex (mutex)
+  (check-type mutex mutex)
   (check-mutex-release-consistence mutex)
   (setf (mutex-owner mutex) nil)
   (when (not (eql (sys.int::cas (mutex-state mutex) :locked :unlocked) :locked))
@@ -180,28 +228,98 @@
     (when (mutex-held-p mutex)
       (release-mutex mutex))))
 
-(defmacro with-mutex ((mutex &optional (wait-p t)) &body body)
+(defmacro with-mutex ((mutex &key (wait-p t) resignal-errors) &body body)
   "Run body with MUTEX locked.
-May be used from an interrupt handler when WAIT-P is false or if MUTEX is a spin mutex."
-  ;; Cold generator has some odd problems with uninterned symbols...
-  `(flet ((call-with-mutex-thunk () ,@body))
-     (declare (dynamic-extent #'call-with-mutex-thunk))
-     (call-with-mutex #'call-with-mutex-thunk
-                      ,mutex
-                      ,wait-p)))
+May be used from an interrupt handler when TIMEOUT is 0.
+If RESIGNAL-ERRORS is non-NIL, any conditions signalled inside BODY
+that match the type specified by RESIGNAL-ERRORS (as by HANDLER-CASE/-BIND)
+will be resignalled (via ERROR) with the lock released.
+If RESIGNAL-ERRORS is T, then it will be treated as though it were ERROR."
+  (let ((call-with-mutex-thunk (gensym "CALL-WITH-MUTEX-THUNK")))
+    (flet ((emit-body ()
+             `(flet ((,call-with-mutex-thunk () ,@body))
+                (declare (dynamic-extent #',call-with-mutex-thunk))
+                (call-with-mutex #',call-with-mutex-thunk
+                                 ,mutex
+                                 ,wait-p))))
+      (cond (resignal-errors
+             `(handler-case ,(emit-body)
+                (,(if (eql resignal-errors 't)
+                      'error
+                      resignal-errors)
+                    (condition)
+                  (error condition))))
+            (t
+             (emit-body))))))
 
 (defstruct (condition-variable
              (:include wait-queue)
              (:constructor make-condition-variable (&optional name))
              (:area :wired)))
 
+(defmacro condition-wait-for ((condition-variable mutex &optional timeout) &body predicate)
+  "Evaluate PREDICATE in a loop, waiting on CONDITION-VARIABLE until PREDICATE returns true.
+Returns the first non-NIL result of PREDICATE, or NIL if a timeout occurs.
+The second return value is the remaining timeout, or NIL if no timeout was specified.
+A block named NIL is defined allowing RETURN to be used within the predicate.
+Handles timeouts properly."
+  (let ((timeout-sym (gensym "TIMEOUT"))
+        (timer-sym (gensym "TIMER"))
+        (cvar-sym (gensym "CVAR"))
+        (mutex-sym (gensym "MUTEX"))
+        (predicate-fn (gensym "PREDICATE"))
+        (prediate-result-sym (gensym)))
+    `(let ((,cvar-sym ,condition-variable)
+           (,mutex-sym ,mutex)
+           (,timeout-sym ,timeout))
+       (block nil
+         (flet ((,predicate-fn () (progn ,@predicate)))
+           (cond ((eql ,timeout-sym 0)
+                  (values (,predicate-fn) 0))
+                 (,timeout-sym
+                  (mezzano.supervisor:with-timer (,timer-sym :relative ,timeout-sym
+                                                             :name ,cvar-sym)
+                    (loop
+                       (let ((,prediate-result-sym (,predicate-fn)))
+                         (when ,prediate-result-sym
+                           (return (values ,prediate-result-sym
+                                           (timer-remaining ,timer-sym)))))
+                       (when (mezzano.supervisor:timer-expired-p ,timer-sym)
+                         (return (values nil 0)))
+                       (condition-wait ,cvar-sym ,mutex-sym ,timer-sym))))
+                 (t
+                  (loop
+                     (let ((,prediate-result-sym (,predicate-fn)))
+                       (when ,prediate-result-sym
+                         (return (values ,prediate-result-sym nil))))
+                     (condition-wait ,cvar-sym ,mutex-sym)))))))))
+
 (defun condition-wait (condition-variable mutex &optional timeout)
+  "Wait for a notification on CONDITION-VARIBLE.
+It is not defined if MUTEX is dropped & reacquired if TIMEOUT expires immediately.
+False wakeups can occur and calling code must account for them.
+Returns true if a normal or false wakeup occurs, false if a timeout occurs."
+  (check-type condition-variable condition-variable)
+  (check-type mutex mutex)
+  (check-type timeout (or null timer real))
   (assert (mutex-held-p mutex))
   (check-mutex-release-consistence mutex)
   (ensure-interrupts-enabled)
+  (thread-pool-blocking-hijack condition-wait condition-variable mutex timeout)
   (unwind-protect
-       (cond (timeout
-              (with-timer (timer :relative timeout)
+       (cond ((timer-p timeout)
+              (assert (not (timer-cvar timeout)))
+              (unwind-protect
+                   (progn
+                     (setf (timer-cvar timeout) condition-variable)
+                     (%call-on-wired-stack-without-interrupts
+                      #'condition-wait-inner nil condition-variable mutex timeout)
+                     ;; This gets a little fuzzy with timeouts vs a legit wake...
+                     (not (timer-expired-p timeout)))
+                ;; Make sure to clear the timer's cvar slot before returning it.
+                (setf (timer-cvar timeout) nil)))
+             (timeout
+              (with-timer (timer :relative timeout :name condition-variable)
                 (unwind-protect
                      (progn
                        (setf (timer-cvar timer) condition-variable)
@@ -231,6 +349,7 @@ May be used from an interrupt handler when WAIT-P is false or if MUTEX is a spin
     (when (and timer (timer-expired-p timer))
       (unlock-wait-queue condition-variable)
       (unlock-wait-queue mutex)
+      (release-global-thread-lock)
       (return-from condition-wait-inner))
     ;; Attach to the list.
     (push-wait-queue self condition-variable)
@@ -252,6 +371,7 @@ May be used from an interrupt handler when WAIT-P is false or if MUTEX is a spin
 (defun condition-notify (condition-variable &optional broadcast)
   "Wake one or many threads waiting on CONDITION-VARIABLE.
 May be used from an interrupt handler, assuming the associated mutex is interrupt-safe."
+  (check-type condition-variable condition-variable)
   (safe-without-interrupts (condition-variable broadcast)
     (flet ((pop-one ()
              (wake-thread (pop-wait-queue condition-variable))))
@@ -267,6 +387,394 @@ May be used from an interrupt handler, assuming the associated mutex is interrup
                (when (condition-variable-head condition-variable)
                  (pop-one)))))))
   (values))
+
+;;;; The EVENT primitive, used by WAIT-FOR-OBJECTS
+;;;; to support waiting for multiple objects.
+
+(sys.int::defglobal *big-wait-for-objects-lock*)
+
+(defstruct (event
+             (:constructor %make-event (name %state))
+             (:include wait-queue)
+             (:area :wired))
+  %state
+  monitors)
+
+(defun make-event (&key name state)
+  "Create a new event with the specified initial state."
+  (%make-event name state))
+
+(defun event-state (event)
+  "Return the current state of EVENT."
+  (event-%state event))
+
+(defun (setf event-state) (value event)
+  "Set the state of EVENT.
+STATE may be any object and will be treated as a generalized boolean by EVENT-WAIT and WAIT-FOR-OBJECTS."
+  (check-type event event)
+  (safe-without-interrupts (value event)
+    (with-place-spinlock (*big-wait-for-objects-lock*)
+      (when (and value
+                 (not (event-%state event)))
+        ;; Moving from the false state to the true state. Wake waiters.
+        (loop
+           for monitor = (event-monitors event)
+           then (watcher-event-monitor-event-next monitor)
+           until (null monitor)
+           do
+             (let ((watcher (watcher-event-monitor-watcher monitor)))
+               (with-wait-queue-lock (watcher)
+                 (do ()
+                     ((null (wait-queue-head watcher)))
+                   (wake-thread (pop-wait-queue watcher))))))
+        (with-wait-queue-lock (event)
+          (do ()
+              ((null (wait-queue-head event)))
+            (wake-thread (pop-wait-queue event)))))
+      (setf (event-%state event) value))))
+
+(defmacro event-wait-for ((event &key timeout) &body predicate)
+  "As with CONDITION-WAIT-FOR, this waits until PREDICATE is true using EVENT as a way of blocking.
+EVENT can be any object that supports GET-OBJECT-EVENT."
+  (let ((timeout-sym (gensym "TIMEOUT"))
+        (timer-sym (gensym "TIMER"))
+        (event-sym (gensym "EVENT"))
+        (predicate-fn (gensym "PREDICATE"))
+        (prediate-result-sym (gensym)))
+    `(let ((,event-sym (convert-object-to-event ,event))
+           (,timeout-sym ,timeout))
+       (block nil
+         (flet ((,predicate-fn () (progn ,@predicate)))
+           (cond ((eql ,timeout-sym 0)
+                  (values (,predicate-fn) 0))
+                 (,timeout-sym
+                  (mezzano.supervisor:with-timer (,timer-sym :relative ,timeout-sym :name ,event-sym)
+                    (loop
+                       (let ((,prediate-result-sym (,predicate-fn)))
+                         (when ,prediate-result-sym
+                           (return (values ,prediate-result-sym
+                                           (timer-remaining ,timer-sym)))))
+                       (when (mezzano.supervisor:timer-expired-p ,timer-sym)
+                         (return (values nil 0)))
+                       (mezzano.supervisor:wait-for-objects ,timer-sym ,event-sym))))
+                 (t
+                  (loop
+                     (let ((,prediate-result-sym (,predicate-fn)))
+                       (when ,prediate-result-sym
+                         (return (values ,prediate-result-sym nil))))
+                     (mezzano.supervisor:event-wait ,event-sym)))))))))
+
+(defun event-wait (event)
+  "Wait until EVENT's state is not NIL."
+  (check-type event event)
+  (thread-pool-blocking-hijack event-wait event)
+  (%run-on-wired-stack-without-interrupts (sp fp event)
+    (acquire-place-spinlock *big-wait-for-objects-lock*)
+    (let ((self (current-thread)))
+      (lock-wait-queue event)
+      (cond ((event-%state event)
+             ;; Event state is non-NIL, don't sleep.
+             (unlock-wait-queue event)
+             (release-place-spinlock *big-wait-for-objects-lock*))
+            (t
+             ;; Event state is NIL.
+             (acquire-global-thread-lock)
+             ;; Attach to the list.
+             (push-wait-queue self event)
+             ;; Sleep.
+             (setf (thread-wait-item self) event
+                   (thread-state self) :sleeping
+                   (thread-unsleep-helper self) #'event-wait
+                   (thread-unsleep-helper-argument self) event)
+             (unlock-wait-queue event)
+             (release-place-spinlock *big-wait-for-objects-lock*)
+             (%reschedule-via-wired-stack sp fp))))))
+
+;;; Event/object watcher.
+;;;
+;;; This is a generalization of WAIT-FOR-OBJECTS that allows users
+;;; to front-load allocation.
+;;; W-F-O performs allocation each call, but watchers only perform
+;;; allocation at creation & object addition time.
+;;; Drivers can create & initialize a watcher during device
+;;; initialization, and then use it during normal operation
+;;; without performing any additional allocations.
+
+;; Object pools are used for watcher & associated structures.
+;; This is to reduce allocation in the wired area which is
+;; very slow, and GCing the wired area requires a full GC cycle.
+(sys.int::defglobal *watcher-pool-lock* (make-mutex "watcher pool"))
+(sys.int::defglobal *watcher-pool-hit-count* 0)
+(sys.int::defglobal *watcher-pool-miss-count* 0)
+
+(sys.int::defglobal *watcher-watcher-pool* nil)
+(sys.int::defglobal *watcher-watcher-pool-size* 0)
+(sys.int::defglobal *watcher-watcher-pool-limit* 1000)
+
+(sys.int::defglobal *watcher-monitor-pool* nil)
+(sys.int::defglobal *watcher-monitor-pool-size* 0)
+(sys.int::defglobal *watcher-monitor-pool-limit* 1000)
+
+(defstruct (watcher
+             (:constructor %make-watcher (name))
+             (:include wait-queue)
+             (:area :wired))
+  watched-objects)
+
+(defstruct (watcher-event-monitor
+             (:constructor %make-watcher-event-monitor (watcher object event))
+             (:area :wired))
+  (result-cons (sys.int::cons-in-area nil nil :wired))
+  object
+  event
+  watcher
+  ;; Links in the event's watcher list.
+  event-next
+  ;; Links in the watcher's watched-object list.
+  watcher-next)
+
+(defun convert-object-to-event (object)
+  ;; Special case some events to avoid the call
+  ;; through G-O-E as it is defined much later.
+  (let ((event (typecase object
+                 (event object)
+                 (timer (timer-event object))
+                 (simple-irq (simple-irq-event object))
+                 (t (get-object-event object)))))
+    (assert (event-p event))
+    event))
+
+(defmacro with-watcher ((watcher &key name) &body body)
+  "Execute BODY with a watcher, destroys the watcher on unwind."
+  (let ((watcher-sym (gensym "WATCHER")))
+    `(let ((,watcher-sym (make-watcher :name ,name)))
+       (unwind-protect
+            (let ((,watcher ,watcher-sym))
+              ,@body)
+         (watcher-destroy ,watcher-sym)))))
+
+(defun make-watcher (&key name)
+  "Create a new event watcher."
+  ;; Structured so that CONS-IN-AREA isn't called inside the pool lock.
+  ;; Snapshot should be inhibited so that the lock is never held at the
+  ;; start of boot.
+  (flet ((pop-pool ()
+           (with-snapshot-inhibited ()
+             (with-mutex (*watcher-pool-lock*)
+               (let ((watcher *watcher-watcher-pool*))
+                 (cond (watcher
+                        (setf *watcher-watcher-pool* (watcher-watched-objects watcher))
+                        (decf *watcher-watcher-pool-size*)
+                        (setf (watcher-name watcher) name
+                              (watcher-watched-objects watcher) nil)
+                        (incf *watcher-pool-hit-count*)
+                        watcher)
+                       (t
+                        (incf *watcher-pool-miss-count*)
+                        nil)))))))
+    (declare (dynamic-extent #'pop-pool))
+    (or (pop-pool)
+        (%make-watcher name))))
+
+(defun watcher-destroy (watcher)
+  "Unregister WATCHER from all watched events.
+This must be called when the WATCHER is no longer needed.
+The watcher and the list returned by WATCHER-WAIT must not be used
+after this function returns."
+  (check-type watcher watcher)
+  (loop
+     for monitor = (watcher-watched-objects watcher)
+     until (null monitor)
+     do (watcher-remove monitor watcher))
+  (unmake-watcher watcher)
+  (values))
+
+(defun unmake-watcher (watcher)
+  (assert (null (watcher-watched-objects watcher)))
+  (with-snapshot-inhibited ()
+    (with-mutex (*watcher-pool-lock*)
+      (when (< *watcher-watcher-pool-size* *watcher-watcher-pool-limit*)
+        (incf *watcher-watcher-pool-size*)
+        (setf (watcher-name watcher) 'pooled-watcher) ; don't leak the old name
+        (shiftf (watcher-watched-objects watcher)
+                *watcher-watcher-pool*
+                watcher)))))
+
+(defun make-watcher-event-monitor (watcher object event)
+  "Create a new event watcher monitor."
+  ;; Structured so that CONS-IN-AREA isn't called inside the pool lock.
+  (flet ((pop-pool ()
+           (with-snapshot-inhibited ()
+             (with-mutex (*watcher-pool-lock*)
+               (let ((monitor *watcher-monitor-pool*))
+                 (cond (monitor
+                        (setf *watcher-monitor-pool* (watcher-event-monitor-watcher monitor))
+                        (decf *watcher-monitor-pool-size*)
+                        (setf (watcher-event-monitor-watcher monitor) watcher
+                              (watcher-event-monitor-event monitor) event
+                              (watcher-event-monitor-object monitor) object)
+                        (incf *watcher-pool-hit-count*)
+                        monitor)
+                       (t
+                        (incf *watcher-pool-miss-count*)
+                        nil)))))))
+    (declare (dynamic-extent #'pop-pool))
+    (or (pop-pool)
+        (%make-watcher-event-monitor watcher object event))))
+
+(defun unmake-watcher-event-monitor (monitor)
+  (with-snapshot-inhibited ()
+    (with-mutex (*watcher-pool-lock*)
+      (when (< *watcher-monitor-pool-size* *watcher-monitor-pool-limit*)
+        (incf *watcher-monitor-pool-size*)
+        ;; Don't leak objects.
+        (setf (car (watcher-event-monitor-result-cons monitor)) nil
+              (cdr (watcher-event-monitor-result-cons monitor)) nil
+              (watcher-event-monitor-object monitor) nil
+              (watcher-event-monitor-event monitor) nil
+              (watcher-event-monitor-watcher monitor) nil
+              (watcher-event-monitor-event-next monitor) nil
+              (watcher-event-monitor-watcher-next monitor) nil)
+        (shiftf (watcher-event-monitor-watcher monitor)
+                *watcher-monitor-pool*
+                monitor)))))
+
+(defun watcher-add-object (object watcher)
+  "Begin watching a new object.
+OBJECT's underlying event is fetched via GET-OBJECT-EVENT as normal.
+Returns an opaque tag that can be passed to WATCHER-REMOVE.
+If an object is added multiple times then it will be watched multiple times
+and can appear multiple times in the watch list.
+Invalidates the list returned by WATCHER-WAIT.
+This function allocates."
+  (check-type watcher watcher)
+  (let* ((event (convert-object-to-event object))
+         (monitor (make-watcher-event-monitor watcher object event)))
+    (safe-without-interrupts (watcher event monitor)
+      (with-place-spinlock (*big-wait-for-objects-lock*)
+        ;; Link onto the watched objects list.
+        (shiftf (watcher-event-monitor-watcher-next monitor)
+                (watcher-watched-objects watcher)
+                monitor)
+        ;; Link onto the event's watcher list.
+        (shiftf (watcher-event-monitor-event-next monitor)
+                (event-monitors event)
+                monitor)))
+    monitor))
+
+(defun watcher-remove (tag watcher)
+  "Stop watching an object.
+TAG must be the tag returned by WATCHER-ADD-OBJECT.
+Invalidates the list returned by WATCHER-WAIT."
+  ;; Opaque tags are used here to allow multiple identical
+  ;; objects to be disambiguated.
+  (check-type watcher watcher)
+  (check-type tag watcher-event-monitor)
+  (safe-without-interrupts (tag watcher)
+    (with-place-spinlock (*big-wait-for-objects-lock*)
+      ;; Remove from the watcher's monitor list.
+      (loop
+         for prev = nil then monitor
+         for monitor = (watcher-watched-objects watcher)
+         then (watcher-event-monitor-watcher-next monitor)
+         until (null monitor)
+         when (eql monitor tag)
+         do
+           (if prev
+               (setf (watcher-event-monitor-watcher-next prev)
+                     (watcher-event-monitor-watcher-next monitor))
+               (setf (watcher-watched-objects watcher)
+                     (watcher-event-monitor-watcher-next monitor))))
+      ;; Remove from the event's monitor list.
+      (loop
+         with event = (watcher-event-monitor-event tag)
+         for prev = nil then monitor
+         for monitor = (event-monitors event)
+         then (watcher-event-monitor-event-next monitor)
+         until (null monitor)
+         when (eql monitor tag)
+         do
+           (if prev
+               (setf (watcher-event-monitor-event-next prev)
+                     (watcher-event-monitor-event-next monitor))
+               (setf (event-monitors event)
+                     (watcher-event-monitor-event-next monitor))))))
+  (unmake-watcher-event-monitor tag)
+  (values))
+
+(defun watcher-objects (watcher)
+  "Return a fresh list containing the objects being watched by WATCHER."
+  (check-type watcher watcher)
+  (loop
+     for monitor = (watcher-watched-objects watcher)
+     then (watcher-event-monitor-watcher-next monitor)
+     until (null monitor)
+     collect (watcher-event-monitor-object monitor)))
+
+(defun watcher-wait-1 (sp fp watcher)
+  (acquire-place-spinlock *big-wait-for-objects-lock*)
+  ;; Scan each object now looking for events that're active.
+  (let ((active-events nil))
+    (loop
+       for monitor = (watcher-watched-objects watcher)
+       then (watcher-event-monitor-watcher-next monitor)
+       until (null monitor)
+       when (event-%state (watcher-event-monitor-event monitor))
+       do
+         (let ((link (watcher-event-monitor-result-cons monitor)))
+           (setf (car link) (watcher-event-monitor-object monitor))
+           (shiftf (cdr link)
+                   active-events
+                   link)))
+    (when active-events
+      ;; There were some completed events.
+      (release-place-spinlock *big-wait-for-objects-lock*)
+      (return-from watcher-wait-1 active-events)))
+  ;; Now go to sleep, zzz.
+  (let ((self (current-thread)))
+    (lock-wait-queue watcher)
+    (release-place-spinlock *big-wait-for-objects-lock*)
+    (acquire-global-thread-lock)
+    ;; Attach to the list.
+    (push-wait-queue self watcher)
+    ;; Sleep.
+    (setf (thread-wait-item self) watcher
+          (thread-state self) :sleeping
+          ;; Reenter the wait after being interrupted.
+          (thread-unsleep-helper self) #'watcher-wait
+          (thread-unsleep-helper-argument self) watcher)
+    (unlock-wait-queue watcher)
+    (%reschedule-via-wired-stack sp fp)))
+
+(defun watcher-wait (watcher)
+  "Wait for at least one object to activate.
+Returns a list of objects were active or became active during the call to WATCHER-WAIT.
+The returned list is not fresh and operations on the watcher will destroy it.
+This function does not allocate.
+This function is not thread-safe. The watcher must not be modified during a
+to WATCHER-WAIT and WATCHER-WAIT must not be called simultaneously from
+multiple threads."
+  (check-type watcher watcher)
+  (thread-pool-blocking-hijack watcher-wait watcher wait-p)
+  (loop
+     (let ((completed (%call-on-wired-stack-without-interrupts
+                       #'watcher-wait-1 nil
+                       watcher)))
+       (when completed
+         (return completed)))))
+
+;;;; WAIT-FOR-OBJECTS.
+
+(defun wait-for-objects (&rest objects)
+  (declare (dynamic-extent objects))
+  (with-watcher (watcher)
+    (dolist (object objects)
+      (watcher-add-object object watcher))
+    ;; The returned list must be copied as the watcher is about to
+    ;; be destroyed.
+    (copy-list (watcher-wait watcher))))
+
+;;;; IRQ-FIFO. An interrupt-safe fixed-size FIFO queue.
 
 (defstruct (irq-fifo
              (:area :wired)
@@ -302,6 +810,7 @@ May be used from an interrupt handler, assuming the associated mutex is interrup
   "Push a byte onto FIFO. Returns true if there was space and value was pushed successfully.
 If the fifo is full, then FIFO-PUSH will return false.
 Safe to use from an interrupt handler."
+  (check-type fifo irq-fifo)
   (safe-without-interrupts (value fifo)
     (with-place-spinlock ((irq-fifo-lock fifo))
       (let ((next (1+ (irq-fifo-tail fifo))))
@@ -320,6 +829,7 @@ Safe to use from an interrupt handler."
 Returns two values. The first value is the value popped from the FIFO.
 The second value is true if a value was popped, false otherwise.
 It is only possible for the second value to be false when wait-p is false."
+  (check-type fifo irq-fifo)
   (loop
        (multiple-value-bind (value validp)
            (safe-without-interrupts (fifo)
@@ -345,303 +855,10 @@ It is only possible for the second value to be false when wait-p is false."
 
 (defun irq-fifo-reset (fifo)
   "Flush any waiting data."
+  (check-type fifo irq-fifo)
   (safe-without-interrupts (fifo)
     (with-place-spinlock ((irq-fifo-lock fifo))
       (setf (irq-fifo-head fifo) 0
             (irq-fifo-tail fifo) 0
             (irq-fifo-count fifo) 0)
       (setf (event-state (irq-fifo-data-available fifo)) nil))))
-
-;;;; WAIT-FOR-OBJECTS and the EVENT primitive.
-
-(defstruct (wfo
-             (:constructor %make-wfo)
-             (:include wait-queue)
-             (:area :wired))
-  objects
-  events
-  links)
-
-(sys.int::defglobal *big-wait-for-objects-lock*)
-
-;; Object pools are used for WFO structures and the wired cons cells
-;; used to form the events & links lists. This is to reduce allocation
-;; in the wired area which is very slow, and GCing the wired area requires
-;; a full GC cycle.
-(sys.int::defglobal *wfo-pool-lock* (make-mutex "WFO pool"))
-(sys.int::defglobal *wfo-pool-hit-count* 0)
-(sys.int::defglobal *wfo-pool-miss-count* 0)
-
-(sys.int::defglobal *wfo-cons-pool* '())
-(sys.int::defglobal *wfo-cons-pool-size* 0)
-(sys.int::defglobal *wfo-cons-pool-limit* 1000)
-
-(defun wfo-cons (car cdr)
-  ;; Structured so that CONS-IN-AREA isn't called inside the pool lock.
-  (flet ((pop-pool ()
-           (with-mutex (*wfo-pool-lock*)
-             (let ((cons *wfo-cons-pool*))
-               (cond (cons
-                      (setf *wfo-cons-pool* (cdr cons))
-                      (decf *wfo-cons-pool-size*)
-                      (setf (car cons) car
-                            (cdr cons) cdr)
-                      (incf *wfo-pool-hit-count*)
-                      cons)
-                     (t
-                      (incf *wfo-pool-miss-count*)
-                      nil))))))
-    (or (pop-pool)
-        (sys.int::cons-in-area car cdr :wired))))
-
-(defun wfo-uncons (cons)
-  (with-mutex (*wfo-pool-lock*)
-    (when (< *wfo-cons-pool-size* *wfo-cons-pool-limit*)
-      (incf *wfo-cons-pool-size*)
-      (setf (car cons) nil ; don't leak objects!
-            (cdr cons) *wfo-cons-pool*)
-      (setf *wfo-cons-pool* cons))))
-
-(defun wfo-uncons-list (list)
-  "Like WFO-UNCONS, but unconses the entire spine of LIST."
-  (with-mutex (*wfo-pool-lock*)
-    (loop
-       (when (or (null list)
-                 (>= *wfo-cons-pool-size* *wfo-cons-pool-limit*))
-         (return))
-       (let ((cons list))
-         (setf list (cdr cons))
-         (incf *wfo-cons-pool-size*)
-         (setf (car cons) nil ; don't leak objects!
-               (cdr cons) *wfo-cons-pool*)
-         (setf *wfo-cons-pool* cons)))))
-
-(sys.int::defglobal *wfo-pool* '())
-(sys.int::defglobal *wfo-pool-size* 0)
-(sys.int::defglobal *wfo-pool-limit* 1000)
-
-(defun make-wfo (&key objects events)
-  ;; Structured so that %MAKE-WFO isn't called inside the pool lock.
-  (flet ((pop-pool ()
-           (with-mutex (*wfo-pool-lock*)
-             (let ((wfo *wfo-pool*))
-               (cond (wfo
-                      (setf *wfo-pool* (wfo-links wfo))
-                      (decf *wfo-pool-size*)
-                      (setf (wfo-objects wfo) objects
-                            (wfo-events wfo) events
-                            (wfo-links wfo) nil)
-                      (incf *wfo-pool-hit-count*)
-                      wfo)
-                     (t
-                      (incf *wfo-pool-miss-count*)
-                      nil))))))
-    (or (pop-pool)
-        (%make-wfo :objects objects :events events))))
-
-(defun unmake-wfo (wfo)
-  (with-mutex (*wfo-pool-lock*)
-    (when (< *wfo-pool-size* *wfo-pool-limit*)
-      (incf *wfo-pool-size*)
-      (setf (wfo-objects wfo) nil ; don't leak objects!
-            (wfo-events wfo) nil
-            (wfo-links wfo) *wfo-pool*)
-      (setf *wfo-pool* wfo))))
-
-(defun wfo-wait-1 (sp fp wfo)
-  (acquire-place-spinlock *big-wait-for-objects-lock*)
-  ;; Scan for completed events before registration.
-  (let ((completed nil))
-    (dolist (event (wfo-events wfo))
-      (let ((state (event-%state event)))
-        (when state
-          ;; This one is completed.
-          (let ((link (wfo-links wfo)))
-            (setf (wfo-links wfo) (cdr link))
-            (setf (car link) event
-                  (cdr link) completed
-                  completed link)))))
-    (when completed
-      ;; There were some completed events.
-      (release-place-spinlock *big-wait-for-objects-lock*)
-      (return-from wfo-wait-1 completed)))
-  ;; Register our wait queue with each event.
-  (dolist (event (wfo-events wfo))
-    (let ((link (wfo-links wfo)))
-      (setf (wfo-links wfo) (cdr link))
-      (setf (cdr link) (event-waiters event)
-            (event-waiters event) link)))
-  ;; Set LINKS to :SLEEP-IN-PROGRESS to indicate that events were registered
-  ;; with and WFO-UNREGISTER must be run.
-  ;; See the big comment in WFO-WAIT.
-  (setf (wfo-links wfo) :sleep-in-progress)
-  ;; Now go to sleep, zzz.
-  (let ((self (current-thread)))
-    (lock-wait-queue wfo)
-    (release-place-spinlock *big-wait-for-objects-lock*)
-    (acquire-global-thread-lock)
-    ;; Attach to the list.
-    (push-wait-queue self wfo)
-    ;; Sleep.
-    (setf (thread-wait-item self) wfo
-          (thread-state self) :sleeping
-          (thread-unsleep-helper self) #'wfo-unsleep-helper
-          (thread-unsleep-helper-argument self) wfo)
-    (unlock-wait-queue wfo)
-    (%reschedule-via-wired-stack sp fp)))
-
-(defun wfo-unsleep-helper (wfo)
-  (declare (ignore wfo))
-  nil)
-
-(defun wfo-unregister (wfo)
-  (safe-without-interrupts (wfo)
-    (with-place-spinlock (*big-wait-for-objects-lock*)
-      ;; Unregister from events and reclaim the links.
-      ;; This resets the WFO object and prepares it for re-waiting.
-      (flet ((unregister-from-event (event marker)
-               (do ((itr (event-waiters event) (cdr itr))
-                    (prev nil itr))
-                   ((null itr)
-                    (panic "WFO link not registered?"))
-                 (when (eql (car itr) marker)
-                   (cond (prev
-                          (setf (cdr prev) (cdr itr)))
-                         (t
-                          (setf (event-waiters event) (cdr itr))))
-                   (return itr)))))
-        (setf (wfo-links wfo) '())
-        (dolist (event (wfo-events wfo))
-          (let ((link (unregister-from-event event wfo)))
-            (setf (cdr link) (wfo-links wfo)
-                  (wfo-links wfo) link)))))))
-
-(defun wfo-wait (wfo)
-  ;; Loop required because the thread may be woken up and
-  ;; not have any ready events.
-  (loop
-     (unwind-protect
-          (let ((completed (%call-on-wired-stack-without-interrupts
-                            #'wfo-wait-1 nil
-                            wfo)))
-            (when completed
-              (return completed)))
-       ;; There are 5 ways to end up here:
-       ;; 1) Normal return from WFO-WAIT-1 with completed events.
-       ;; 2) Normal return without any completed events.
-       ;; 3) Interrupted sleep, via normal return from the wfo unsleep helper.
-       ;; 4) Interrupted sleep, via unwind.
-       ;; 5) Unwinding after establishing the cleanup handler but before
-       ;;    turning interrupts off.
-       ;; Cases 2,3,4 are all effectively identical: WFO-WAIT-1 registered
-       ;; the WFO with events and went to sleep. The WFO must be unregistered
-       ;; from the events.
-       ;; Cases 1 and 5 are similar: WFO-WAIT-1 did not register with any
-       ;; events and WFO-UNREGISTER must *not* be called.
-       ;; UNWIND-PROTECT catches case 4, cases 2 and 3 could be done in
-       ;; the loop without an unwind protect. UNWIND-PROTECT screws over
-       ;; cases 1 & 5, so extra tests are required to avoid this.
-       ;; To resolve this, WFO-LINKS is set to :SLEEP-IN-PROGRESS after
-       ;; WFO-WAIT-1 registers with events and actually goes to sleep.
-       (when (eql (wfo-links wfo) :sleep-in-progress)
-         (wfo-unregister wfo)))))
-
-(defun convert-objects-to-events (objects)
-  ;; The event list must be wired, so do this instead of a simple mapcar.
-  (let* ((head (cons nil nil))
-         (tail head))
-    (declare (dynamic-extent head))
-    (dolist (object objects)
-      ;; Special case events to avoid the call
-      ;; through G-O-E as it is defined much later.
-      (let ((event (typecase object
-                     (event object)
-                     (timer (timer-event object))
-                     (t (get-object-event object)))))
-        (setf (cdr tail) (wfo-cons event nil)
-              tail (cdr tail))))
-    (cdr head)))
-
-(defun wait-for-objects (&rest objects)
-  ;; Objects converted to events.
-  (let* ((events (convert-objects-to-events objects))
-         (wfo (make-wfo :objects objects
-                        :events events)))
-    ;; Allocate links for each event.
-    (dolist (evt events)
-      (declare (ignore evt))
-      (setf (wfo-links wfo) (wfo-cons wfo (wfo-links wfo))))
-    ;; Wait & convert completed events back to objects
-    (let* ((completed (wfo-wait wfo))
-           (completed-objects (loop
-                                 for evt in completed
-                                 collect (loop
-                                            for input-object in objects
-                                            for input-event in events
-                                            when (eql evt input-event)
-                                            do (return input-object)
-                                            finally (error "Impossible? Can't convert event back to object")))))
-      ;; Make sure to release links back to the pool
-      (wfo-uncons-list completed)
-      (wfo-uncons-list events)
-      (wfo-uncons-list (wfo-links wfo))
-      (unmake-wfo wfo)
-      completed-objects)))
-
-(defstruct (event
-             (:constructor %make-event (name %state))
-             (:include wait-queue)
-             (:area :wired))
-  %state
-  waiters)
-
-(defun make-event (&key name state)
-  "Create a new event with the specified initial state."
-  (%make-event name state))
-
-(defun event-state (event)
-  "Return the current state of EVENT."
-  (event-%state event))
-
-(defun (setf event-state) (value event)
-  "Set the state of EVENT.
-STATE may be any object and will be treated as a generalized boolean by EVENT-WAIT and WAIT-FOR-OBJECTS."
-  (safe-without-interrupts (value event)
-    (with-place-spinlock (*big-wait-for-objects-lock*)
-      (when (and value
-                 (not (event-%state event)))
-        ;; Moving from the false state to the true state. Wake waiters.
-        (dolist (waiter (event-waiters event))
-          (with-wait-queue-lock (waiter)
-            (do ()
-                ((null (wait-queue-head waiter)))
-              (wake-thread (pop-wait-queue waiter)))))
-        (with-wait-queue-lock (event)
-          (do ()
-              ((null (wait-queue-head event)))
-            (wake-thread (pop-wait-queue event)))))
-      (setf (event-%state event) value))))
-
-(defun event-wait (event)
-  "Wait until EVENT's state is not NIL."
-  (%run-on-wired-stack-without-interrupts (sp fp event)
-    (acquire-place-spinlock *big-wait-for-objects-lock*)
-    (let ((self (current-thread)))
-      (lock-wait-queue event)
-      (cond ((event-%state event)
-             ;; Event state is non-NIL, don't sleep.
-             (unlock-wait-queue event)
-             (release-place-spinlock *big-wait-for-objects-lock*))
-            (t
-             ;; Event state is NIL.
-             (acquire-global-thread-lock)
-             ;; Attach to the list.
-             (push-wait-queue self event)
-             ;; Sleep.
-             (setf (thread-wait-item self) event
-                   (thread-state self) :sleeping
-                   (thread-unsleep-helper self) #'event-wait
-                   (thread-unsleep-helper-argument self) event)
-             (unlock-wait-queue event)
-             (release-place-spinlock *big-wait-for-objects-lock*)
-             (%reschedule-via-wired-stack sp fp))))))

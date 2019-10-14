@@ -24,14 +24,21 @@
   (or (find slot-name (mezzano.clos:class-slots class)
             :key #'mezzano.clos:slot-definition-name)
       (if errorp
-          (error "Slot ~S missing from structure definition ~S."
-                 slot-name definition)
+          (error "Slot ~S missing from structure ~S."
+                 slot-name class)
           nil)))
+
+(defun raise-struct-type-error (object class slot-name)
+  (error 'simple-type-error
+         :datum object
+         :expected-type class
+         :format-control "Type error. ~S is not of structure type ~S when accessing slot ~S."
+         :format-arguments (list object (class-name class) slot-name)))
 
 (defun sys.int::%struct-slot (object class-name slot-name)
   (let ((class (sys.int::get-structure-type class-name)))
     (when (not (sys.int::structure-type-p object class))
-      (sys.int::raise-type-error object class)
+      (raise-struct-type-error object class slot-name)
       (sys.int::%%unreachable))
     (let* ((slot (find-struct-slot class slot-name))
            (loc (mezzano.clos:slot-definition-location slot)))
@@ -40,7 +47,7 @@
 (defun (setf sys.int::%struct-slot) (value object class-name slot-name)
   (let ((class (sys.int::get-structure-type class-name)))
     (when (not (sys.int::structure-type-p object class))
-      (sys.int::raise-type-error object class)
+      (raise-struct-type-error object class slot-name)
       (sys.int::%%unreachable))
     (let* ((slot (find-struct-slot class slot-name))
            (type (mezzano.clos:slot-definition-type slot))
@@ -52,7 +59,7 @@
 (defun (sys.int::cas sys.int::%struct-slot) (old new object class-name slot-name)
   (let ((class (sys.int::get-structure-type class-name)))
     (when (not (sys.int::structure-type-p object class))
-      (sys.int::raise-type-error object class)
+      (raise-struct-type-error object class slot-name)
       (sys.int::%%unreachable))
     (let* ((slot (find-struct-slot class slot-name))
            (type (mezzano.clos:slot-definition-type slot))
@@ -70,7 +77,7 @@
 (defun sys.int::%struct-vector-slot (object class-name slot-name index)
   (let ((class (sys.int::get-structure-type class-name)))
     (when (not (sys.int::structure-type-p object class))
-      (sys.int::raise-type-error object class)
+      (raise-struct-type-error object class slot-name)
       (sys.int::%%unreachable))
     (let* ((slot (find-struct-slot class slot-name))
            (loc (mezzano.clos:slot-definition-location slot)))
@@ -80,7 +87,7 @@
 (defun (setf sys.int::%struct-vector-slot) (value object class-name slot-name index)
   (let ((class (sys.int::get-structure-type class-name)))
     (when (not (sys.int::structure-type-p object class))
-      (sys.int::raise-type-error object class)
+      (raise-struct-type-error object class slot-name)
       (sys.int::%%unreachable))
     (let* ((slot (find-struct-slot class slot-name))
            (type (mezzano.clos:slot-definition-type slot))
@@ -93,7 +100,7 @@
 (defun (sys.int::cas sys.int::%struct-vector-slot) (old new object class-name slot-name index)
   (let ((class (sys.int::get-structure-type class-name)))
     (when (not (sys.int::structure-type-p object class))
-      (sys.int::raise-type-error object class)
+      (raise-struct-type-error object class slot-name)
       (sys.int::%%unreachable))
     (let* ((slot (find-struct-slot class slot-name))
            (type (mezzano.clos:slot-definition-type slot))
@@ -150,7 +157,7 @@
                    (sys.int::%struct-slot structure class slot-name))))
     new))
 
-(defun sys.int::make-struct-definition (name slots parent area size layout sealed)
+(defun sys.int::make-struct-definition (name slots parent area size layout sealed docstring has-standard-constructor)
   (when (and parent
              (if (structure-class-p parent)
                  (mezzano.runtime::instance-access-by-name parent 'mezzano.clos::sealed)
@@ -163,7 +170,9 @@
                                                 area
                                                 size
                                                 nil
-                                                sealed))
+                                                sealed
+                                                docstring
+                                                has-standard-constructor))
          (layout-object (sys.int::make-layout
                          :class def
                          :obsolete nil
@@ -191,7 +200,7 @@
 (defstruct (structure-definition
              (:area :wired)
              (:constructor %make-struct-definition
-                           (name slots parent area size layout sealed))
+                           (name slots parent area size layout sealed docstring has-standard-constructor))
              :sealed)
   (name nil :read-only t)
   (slots nil :read-only t :type list)
@@ -200,12 +209,14 @@
   (size nil :read-only t)
   (layout nil)
   (class nil)
-  (sealed nil :read-only t))
+  (sealed nil :read-only t)
+  (docstring nil)
+  (has-standard-constructor t))
 
 (defstruct (structure-slot-definition
              (:area :wired)
              (:constructor make-struct-slot-definition
-                           (name accessor initform type read-only location fixed-vector align))
+                           (name accessor initform type read-only location fixed-vector align documentation))
              :sealed)
   (name nil :read-only t)
   (accessor nil :read-only t)
@@ -214,4 +225,5 @@
   (read-only nil :read-only t)
   (location nil :read-only t)
   (fixed-vector nil :read-only t)
-  (align nil :read-only t))
+  (align nil :read-only t)
+  (documentation nil :read-only t))

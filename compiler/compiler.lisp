@@ -24,27 +24,6 @@ be generated instead.")
 (defvar *optimize-restrictions* '())
 (defvar *optimize-policy* '(safety 3 debug 3 speed 1))
 
-(defvar *use-new-compiler* t)
-
-(defvar *meters* (make-hash-table))
-
-(defmacro with-metering ((meter) &body body)
-  `(call-with-metering ',meter (lambda () ,@body)))
-
-(defun call-with-metering (meter fn)
-  (let ((start-time (get-internal-real-time)))
-    (multiple-value-prog1
-        (funcall fn)
-      (let* ((total-time (- (get-internal-real-time) start-time))
-             (seconds (/ total-time internal-time-units-per-second)))
-        (incf (gethash meter *meters* 0.0) (float seconds))))))
-
-(defun log-event (event-name)
-  (incf (gethash event-name *meters* 0)))
-
-(defun reset-meters ()
-  (clrhash *meters*))
-
 (defun compiler-state-bindings ()
   (let ((symbols '(*should-inline-functions*
                    *perform-tce*
@@ -58,8 +37,7 @@ be generated instead.")
                    *optimize-restrictions*
                    *optimize-policy*
                    *verify-special-stack*
-                   *constprop-lambda-copy-limit*
-                   *use-new-compiler*)))
+                   *constprop-lambda-copy-limit*)))
     (loop
        for sym in symbols
        collect (list sym (symbol-value sym)))))
@@ -83,7 +61,6 @@ be generated instead.")
 
 (defun compile-lambda (lambda &optional env target-architecture)
   (let ((*print-readably* nil))
-    (log-event :compile-lambda)
     (let ((target (canonicalize-target target-architecture)))
       (codegen-lambda (compile-lambda-1 lambda env target) target))))
 
@@ -91,23 +68,10 @@ be generated instead.")
   (let ((target (canonicalize-target target-architecture)))
     (codegen-lambda (compile-lambda-2 ast target) target)))
 
-(defgeneric codegen-lambda-using-target (lambda target))
-
 (defun codegen-lambda (lambda &optional target-architecture)
-  (with-metering (:code-generation)
-    (if *use-new-compiler*
-        (mezzano.compiler.backend:compile-backend-function
-         (mezzano.compiler.backend.ast-convert:convert lambda)
-         (canonicalize-target target-architecture))
-        (codegen-lambda-using-target
-         lambda
-         (canonicalize-target target-architecture)))))
-
-(defmethod codegen-lambda-using-target (lambda (target x86-64-target))
-  (mezzano.compiler.codegen.x86-64:codegen-lambda lambda))
-
-(defmethod codegen-lambda-using-target (lambda (target arm64-target))
-  (mezzano.compiler.codegen.arm64:codegen-lambda lambda))
+  (mezzano.compiler.backend:compile-backend-function
+       (mezzano.compiler.backend.ast-convert:convert lambda)
+       (canonicalize-target target-architecture)))
 
 (defun compile-lambda-1 (lambda &optional env target-architecture)
   (let ((target (canonicalize-target target-architecture)))
@@ -133,6 +97,8 @@ be generated instead.")
     (setf form (lower-special-bindings form))
     (when run-optimizations
       (setf form (simplify form target)))
+    ;; Lower the complicated DX list functions.
+    (setf form (lower-dynamic-extent-list form))
     form))
 
 (defun eval-load-time-value (form read-only-p)
@@ -208,27 +174,26 @@ be generated instead.")
 
 (defun run-optimizers (form target-architecture)
   (setf target-architecture (canonicalize-target target-architecture))
-  (with-metering (:ast-optimize)
-    (when *report-after-optimize-passes*
-      (let ((*report-after-optimize-passes* nil))
-        (format t "Before optimizations:~%")
-        (write (unparse-compiler-form form) :pretty t)
-        (terpri)))
-    (dotimes (i *max-optimizer-iterations*
-              (progn (warn 'sys.int::simple-style-warning
-                           :format-control "Possible optimizer infinite loop."
-                           :format-arguments '())
-                     form))
-      (let ((*change-count* 0))
-        (dolist (pass *optimization-passes*)
-          (setf form (funcall pass form target-architecture))
-          (when *report-after-optimize-passes*
-            (let ((*report-after-optimize-passes* nil))
-              (format t "After optimize pass ~S:~%" pass)
-              (write (unparse-compiler-form form) :pretty t)
-              (terpri))))
-        (when (eql *change-count* 0)
-          (return form))))))
+  (when *report-after-optimize-passes*
+    (let ((*report-after-optimize-passes* nil))
+      (format t "Before optimizations:~%")
+      (write (unparse-compiler-form form) :pretty t)
+      (terpri)))
+  (dotimes (i *max-optimizer-iterations*
+            (progn (warn 'sys.int::simple-style-warning
+                         :format-control "Possible optimizer infinite loop."
+                         :format-arguments '())
+                   form))
+    (let ((*change-count* 0))
+      (dolist (pass *optimization-passes*)
+        (setf form (funcall pass form target-architecture))
+        (when *report-after-optimize-passes*
+          (let ((*report-after-optimize-passes* nil))
+            (format t "After optimize pass ~S:~%" pass)
+            (write (unparse-compiler-form form) :pretty t)
+            (terpri))))
+      (when (eql *change-count* 0)
+        (return form)))))
 
 (defun fixnump (object)
   (typep object '(signed-byte 63)))
@@ -269,3 +234,17 @@ be generated instead.")
   (multiple-value-bind (successp validp)
       (compiler-type-equal-p type-1 type-2 environment)
     (and (not successp) validp)))
+
+(defun fixnum-to-raw (integer)
+  (check-type integer (signed-byte 63))
+  (ash integer sys.int::+n-fixnum-bits+))
+
+(defun character-to-raw (character)
+  (check-type character character)
+  (logior (ash (char-int character)
+               (+ (byte-position sys.int::+immediate-tag+)
+                  (byte-size sys.int::+immediate-tag+)))
+          (dpb sys.int::+immediate-tag-character+
+               sys.int::+immediate-tag+
+               0)
+          sys.int::+tag-immediate+))

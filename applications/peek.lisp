@@ -47,12 +47,14 @@
 
 (defun peek-network ()
   (format t "Network cards:~%")
-  (dolist (card mezzano.network.ethernet::*cards*)
-    (let ((address (mezzano.network.ip:ipv4-interface-address card nil)))
+  (dolist (card (mezzano.sync:watchable-set-items
+                 mezzano.driver.network-card::*nics*))
+    (multiple-value-bind (address prefix-length)
+        (mezzano.network.ip:ipv4-interface-address card nil)
       (format t " ~S~%" card)
       (format t "   Mac: ~/mezzano.network.ethernet:format-mac-address/~%" (mezzano.driver.network-card:mac-address card))
       (when address
-        (format t "   IPv4 address: ~A~%" address))
+        (format t "   IPv4 address: ~A/~D~%" address prefix-length))
       (multiple-value-bind (rx-bytes rx-packets rx-errors tx-bytes tx-packets tx-errors collisions)
           (mezzano.driver.network-card:statistics card)
         (format t "   ~:D octets, ~:D packets received. ~:D RX errors.~%"
@@ -63,13 +65,22 @@
   (format t "Routing table:~%")
   (format t " Network~20TGateway~%")
   (dolist (route mezzano.network.ip::*routing-table*)
-    (format t " ~A/~D~20T~A~%"
+    (format t " ~A/~D~20T~A~@[ [~A]~]~%"
             (mezzano.network.ip::route-network route)
             (mezzano.network.ip::route-prefix-length route)
-            (mezzano.network.ip::route-gateway route)))
-  (format t "Servers:~%")
-  (dolist (server mezzano.network.tcp::*server-alist*)
-    (format t "~S  TCPv4 ~D~%" (second server) (first server)))
+            (mezzano.network.ip::route-gateway route)
+            (mezzano.network.ip::route-tag route)))
+  (format t "DNS servers:~%")
+  (loop
+     for (server . tag) in mezzano.network.dns:*dns-servers*
+     do (format t " ~A~@[ [~A]~]~%" server tag))
+  (format t "Listeners:~%")
+  (dolist (listener mezzano.network.tcp::*tcp-listeners*)
+    (format t " ~S~%" listener))
+  (format t "DHCP leases:~%")
+  (maphash (lambda (nic interaction)
+             (format t " ~S: ~S~%" nic (mezzano.network.dhcp::lease interaction)))
+           mezzano.network.dhcp::*dhcp-interactions*)
   (format t "TCPv4 connections:~%")
   (format t " Local~8TRemote~40TState~%")
   (dolist (conn mezzano.network.tcp::*tcp-connections*)
@@ -227,6 +238,7 @@
       (when (>= extended-cpuid-max #x80000001)
         (multiple-value-bind (a b c d)
             (sys.int::cpuid #x80000001)
+          (declare (ignore a b))
           (setf features (nconc (scan-feature-bits *cpuid-ext-1-ecx-features* c)
                                 (scan-feature-bits *cpuid-ext-1-edx-features* d)
                                 features)))))

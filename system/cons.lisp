@@ -500,9 +500,7 @@
 (defmacro remf (place indicator &environment env)
   (multiple-value-bind (temps vals stores store-form access-form)
       (get-setf-expansion place env)
-    (let ((indicator-sym (gensym))
-          (plist (gensym))
-          (result (gensym)))
+    (let ((result (gensym)))
       (when (cdr stores)
         (error "Can't expand this"))
       `(let* (,@(mapcar #'list temps vals))
@@ -588,7 +586,7 @@
       (return (values (first i) (second i) i)))))
 
 (defun list* (object &rest objects)
-  (declare (dynamic-extent object))
+  (declare (dynamic-extent objects))
   (if objects
       (do* ((i objects (cdr i))
             (result (cons object nil))

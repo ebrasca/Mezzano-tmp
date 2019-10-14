@@ -54,13 +54,20 @@
     (#.+llf-symbol-global-value-cell+ 'symbol-global-value-cell)
     (#.+llf-if+ 'if)
     (#.+llf-else+ 'else)
-    (#.+llf-fi+ 'fi)))
+    (#.+llf-fi+ 'fi)
+    (#.+llf-layout+ 'layout)))
 
 (defun llf-architecture-name (id)
   (case id
     (#.+llf-arch-x86-64+ :x86-64)
     (#.+llf-arch-arm64+ :arm64)
     (t :unknown)))
+
+(defun current-architecture ()
+  #+x86-64 :x86-64
+  #+arm64 :arm64
+  #-(or x86-64 arm64)
+  (error "Define this"))
 
 (defun check-llf-header (stream)
   (assert (and (eql (%read-byte stream) #x4C)
@@ -76,9 +83,7 @@
             "Bad LLF version ~D, wanted version ~D, while loading ~S."
             version *llf-version* stream))
   (let ((arch (llf-architecture-name (load-integer stream))))
-    (assert (eql arch
-                 #+x86-64 :x86-64
-                 #+arm64 :arm64) ()
+    (assert (eql arch (current-architecture)) ()
             "LLF compiled for wrong architecture ~S. Wanted ~S."
             arch (current-architecture))))
 
@@ -152,7 +157,7 @@
     (%read-sequence mc stream)
     ;; Read gc-info bytes.
     (%read-sequence gc-info stream)
-    (make-function-with-fixups tag mc fixups constants gc-info *load-wired*)))
+    (make-function tag mc fixups constants gc-info *load-wired*)))
 
 (defun load-llf-vector (stream stack)
   (let* ((len (load-integer stream))
@@ -171,7 +176,10 @@
        (eql (structure-slot-definition-location x) (structure-slot-definition-location y))))
 
 (defun load-llf-structure-definition (stream stack)
-  (let ((sealed (vector-pop stack))
+  (declare (ignore stream))
+  (let ((has-standard-constructor (vector-pop stack))
+        (docstring (vector-pop stack))
+        (sealed (vector-pop stack))
         (layout (vector-pop stack))
         (size (vector-pop stack))
         (area (vector-pop stack))
@@ -179,10 +187,20 @@
         (slots (vector-pop stack))
         (name (vector-pop stack)))
     ;; Defstruct converts structure definitions to structure classes.
-    (%defstruct (make-struct-definition name slots parent area size layout sealed))))
+    (%defstruct (make-struct-definition name
+                                        slots
+                                        parent
+                                        area
+                                        size
+                                        layout
+                                        sealed
+                                        docstring
+                                        has-standard-constructor))))
 
 (defun load-llf-structure-slot-definition (stream stack)
-  (let* ((align (vector-pop stack))
+  (declare (ignore stream))
+  (let* ((documentation (vector-pop stack))
+         (align (vector-pop stack))
          (fixed-vector (vector-pop stack))
          (location (vector-pop stack))
          (read-only (vector-pop stack))
@@ -190,7 +208,7 @@
          (initform (vector-pop stack))
          (accessor (vector-pop stack))
          (name (vector-pop stack)))
-    (make-struct-slot-definition name accessor initform type read-only location fixed-vector align)))
+    (make-struct-slot-definition name accessor initform type read-only location fixed-vector align documentation)))
 
 (defun load-llf-array (stream stack)
   (let* ((n-dimensions (load-integer stream))

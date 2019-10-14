@@ -13,14 +13,24 @@
 
 (in-package :mezzano.file-system.remote)
 
+(defvar *reuse-connection* t
+  "If true, then the FS will attempt to maintain a single connection to
+the server instead of reconnecting for each operation.")
+(defvar *connection-idle-timeout* 60
+  "Disconnect the reused connection if idle for this long.")
 (defvar *default-remote-file-port* 2599)
 (defvar *cache-size* (* 512 1024))
 
 (defclass remote-file-host ()
   ((%name :initarg :name :reader host-name)
    (%address :initarg :address :reader host-address)
-   (%port :initarg :port :reader host-port))
+   (%port :initarg :port :reader host-port)
+   (%lock :reader remote-host-lock)
+   (%connection :initform nil :accessor remote-host-connection))
   (:default-initargs :port *default-remote-file-port*))
+
+(defmethod initialize-instance :after ((instance remote-file-host) &key)
+  (setf (slot-value instance '%lock) (mezzano.supervisor:make-mutex `(remote-file-host ,instance))))
 
 (defmethod print-object ((object remote-file-host) stream)
   (print-unreadable-object (object stream :type t :identity t)
@@ -52,6 +62,7 @@
 
 (defclass remote-file-character-stream (gray:fundamental-character-input-stream
                                         gray:fundamental-character-output-stream
+                                        sys.int::external-format-mixin
                                         remote-file-stream
                                         gray:unread-char-mixin)
   ())
@@ -168,9 +179,68 @@
 (defmethod namestring-using-host ((host remote-file-host) path)
   (unparse-remote-file-path path))
 
-(defmacro with-connection ((var host) &body body)
-  `(sys.net::with-open-network-stream (,var (host-address ,host) (host-port ,host))
-     ,@body))
+(defmacro with-connection ((var host &key (auto-restart t)) &body body)
+  `(call-with-connection ,host (lambda (,var) ,@body) ,auto-restart))
+
+(defun call-with-connection (host fn auto-restart)
+  (if *reuse-connection*
+      (mezzano.supervisor:with-mutex ((remote-host-lock host))
+        ;; Inhibit snapshots to prevent the connection from becoming stale
+        ;; at a bad time.
+        (mezzano.supervisor:with-snapshot-inhibited ()
+          (prog ()
+           RETRY
+             (when (remote-host-connection host)
+               ;; Tickle any existing connection to make sure it's still open.
+               (handler-case
+                   (read-sequence (load-time-value
+                                   (make-array 0 :element-type '(unsigned-byte 8)))
+                                  (remote-host-connection host))
+                 (mezzano.network.tcp:connection-error ()
+                   (close (remote-host-connection host) :abort t)
+                   (setf (remote-host-connection host) nil))))
+             (when (not (remote-host-connection host))
+               (setf (remote-host-connection host)
+                     (mezzano.network.tcp:tcp-stream-connect
+                      (host-address host) (host-port host)
+                      :timeout *connection-idle-timeout*)))
+             (restart-bind
+                 ((retry (lambda ()
+                           (close (remote-host-connection host))
+                           (setf (remote-host-connection host) nil)
+                           (go RETRY))
+                    :report-function (lambda (stream)
+                                       (format stream "Retry connecting to the file server"))))
+               (handler-bind
+                   ((error (lambda (c)
+                             ;; If an error occurs, then close the current
+                             ;; connection and force the next operation to re-open.
+                             ;; Just in case the connection gets into a bad state.
+                             (close (remote-host-connection host))
+                             (setf (remote-host-connection host) nil)
+                             (when (and (typep c 'mezzano.network.tcp:connection-error)
+                                        auto-restart)
+                               (setf auto-restart nil)
+                               (go RETRY)))))
+                 (return
+                   (funcall fn (remote-host-connection host))))))))
+      (loop
+         (restart-case
+             (return
+               (sys.net::with-open-network-stream (connection (host-address host)
+                                                              (host-port host))
+                 (funcall fn connection)))
+           ((retry ()
+             :report "Retry connecting to the file server"
+             nil))))))
+
+(defmacro with-open-handle ((var pathname connection command) &body body)
+  (let ((id (gensym "ID")))
+    `(let ((,id (command ,pathname ,connection ,command)))
+       (unwind-protect
+            (let ((,var ,id))
+              ,@body)
+         (command ,pathname ,connection `(:close ,,id))))))
 
 (defmethod open-using-host ((host remote-file-host) pathname
                             &key direction element-type if-exists if-does-not-exist external-format)
@@ -178,9 +248,25 @@
         (x nil)
         (created-file nil)
         (abort-action nil)
-        (size nil))
-    (with-connection (con host)
-      (when (not (eql (ignore-errors (command pathname con `(:probe ,path))) :ok))
+        (size nil)
+        (did-retry-connection nil))
+    (with-connection (con host :auto-restart nil) ; Don't auto-restart here, open is complicated.
+      ;; PROBE to check presence of the file and to really make sure
+      ;; the connection is working.
+      (when (not (eql (block nil
+                        (handler-bind
+                            ((mezzano.network.tcp:connection-error
+                              (lambda (c)
+                                (declare (ignore c))
+                                (when (not did-retry-connection)
+                                  (setf did-retry-connection t)
+                                  (invoke-restart 'retry))))
+                             (simple-file-error
+                              (lambda (c)
+                                ;; Error occured during command, just return NIL
+                                (return NIL))))
+                          (command pathname con `(:probe ,path))))
+                      :ok))
         (ecase if-does-not-exist
           (:error (error 'simple-file-error
                          :pathname pathname
@@ -214,19 +300,18 @@
           ((:overwrite :append))
           ((nil) (return-from open-using-host nil))))
       (when (not size)
-        (let ((id (command pathname con `(:open ,path :direction :input))))
+        (with-open-handle (id pathname con `(:open ,path :direction :input))
           (setf size (command pathname con `(:size ,id))))))
     (let ((stream (cond ((or (eql element-type :default)
                              (subtypep element-type 'character))
-                         (assert (member external-format '(:default :utf-8))
-                                 (external-format))
                          (make-instance 'remote-file-character-stream
                                         :path path
                                         :pathname pathname
                                         :length size
                                         :host host
                                         :direction direction
-                                        :abort-action abort-action))
+                                        :abort-action abort-action
+                                        :external-format (sys.int::make-external-format 'character external-format)))
                         ((and (subtypep element-type '(unsigned-byte 8))
                               (subtypep '(unsigned-byte 8) element-type))
                          (assert (eql external-format :default) (external-format))
@@ -246,20 +331,16 @@
 (defmethod probe-using-host ((host remote-file-host) pathname)
   (let ((path (unparse-remote-file-path pathname)))
     (with-connection (con host)
-      (when (eql (ignore-errors (command pathname con `(:probe ,path))) :ok)
+      (when (eql (handler-case (command pathname con `(:probe ,path))
+                   (simple-file-error () nil))
+                 :ok)
         pathname))))
 
-(defmethod gray:stream-element-type ((stream remote-file-stream))
+(defmethod stream-element-type ((stream remote-file-stream))
   '(unsigned-byte 8))
 
-(defmethod gray:stream-element-type ((stream remote-file-character-stream))
-  'character)
-
-(defmethod gray:stream-external-format ((stream remote-file-stream))
+(defmethod stream-external-format ((stream remote-file-stream))
   :default)
-
-(defmethod gray:stream-external-format ((stream remote-file-character-stream))
-  :utf-8)
 
 (defmethod input-stream-p ((stream remote-file-stream))
   (member (direction stream) '(:input :io)))
@@ -287,8 +368,7 @@
              (buffer-dirty-p stream))
     ;; Write data back.
     (with-connection (con (host stream))
-      (let ((id (command stream con
-                         `(:open ,(path stream) :direction :output :if-does-not-exist :error :if-exists :overwrite))))
+      (with-open-handle (id stream con `(:open ,(path stream) :direction :output :if-does-not-exist :error :if-exists :overwrite))
         (command stream con
                  `(:write ,id ,(buffer-position stream) ,(length (buffer stream)))
                  (buffer stream)))))
@@ -361,12 +441,11 @@ The file position must be less than the file length."
                              *cache-size*))
          (buffer (make-array *cache-size* :element-type '(unsigned-byte 8) :fill-pointer bytes-to-read)))
     (with-connection (con (host stream))
-      (let* ((id (command stream con
-                         `(:open ,(path stream) :direction :input)))
-             (count (command stream con
-                             `(:read ,id ,(file-position* stream) ,bytes-to-read))))
-        (assert (eql count bytes-to-read))
-        (read-sequence buffer con)))
+      (with-open-handle (id stream con `(:open ,(path stream) :direction :input))
+        (let ((count (command stream con
+                              `(:read ,id ,(file-position* stream) ,bytes-to-read))))
+          (assert (eql count bytes-to-read))
+          (read-sequence buffer con))))
     (setf (buffer-position stream) (file-position* stream))
     (setf (buffer stream) buffer)))
 
@@ -403,54 +482,6 @@ The file position must be less than the file length."
          (incf offset bytes-to-read)
          (decf bytes-to-go bytes-to-read)))
     (+ start bytes-read)))
-
-(defmethod gray:stream-write-char ((stream remote-file-character-stream) char)
-  (let ((encoded (sys.net::encode-utf-8-string (string char) :eol-style :lf)))
-    (loop
-       for byte across encoded
-       do (gray:stream-write-byte stream byte))))
-
-(defun read-and-decode-char (stream)
-  (let ((leader (read-byte stream nil :eof)))
-    (when (eql leader :eof)
-      (return-from read-and-decode-char :eof))
-    (when (eql leader #x0D)
-      ;; Munch CR characters.
-      (return-from read-and-decode-char
-        (read-and-decode-char stream)))
-    (multiple-value-bind (length code-point)
-        (sys.net::utf-8-decode-leader leader)
-      (when (null length)
-        (return-from read-and-decode-char
-          #\REPLACEMENT_CHARACTER))
-      (dotimes (i length)
-        (let ((byte (read-byte stream nil)))
-          (when (or (null byte)
-                    (/= (ldb (byte 2 6) byte) #b10))
-            (return-from read-and-decode-char
-              #\REPLACEMENT_CHARACTER))
-          (setf code-point (logior (ash code-point 6)
-                                   (ldb (byte 6 0) byte)))))
-      (or (and (< code-point char-code-limit)
-               (code-char code-point))
-          #\REPLACEMENT_CHARACTER))))
-
-(defmethod gray:stream-read-sequence ((stream remote-file-character-stream) sequence &optional (start 0) end)
-  (assert (member (direction stream) '(:input :io)))
-  (cond ((stringp sequence)
-         ;; This is slightly faster than going through method dispatch, but it's not great.
-         (unless end (setf end (length sequence)))
-         (dotimes (i (- end start)
-                   end)
-           (let ((ch (read-and-decode-char stream)))
-             (when (eql ch :eof)
-               (return (+ start i)))
-             (setf (char sequence (+ start i)) ch))))
-        (t (call-next-method))))
-
-(defmethod gray:stream-read-char ((stream remote-file-character-stream))
-  (assert (member (direction stream) '(:input :io)))
-  (read-and-decode-char stream))
 
 (defmethod gray:stream-file-position ((stream remote-file-stream) &optional (position-spec nil position-specp))
   (cond (position-specp

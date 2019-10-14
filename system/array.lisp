@@ -192,12 +192,11 @@
 (defun bit-vector-p (object)
   (typep object '(array bit (*))))
 
-(defun make-simple-array (length &optional (element-type 't) area (initial-element nil initial-element-p))
-  (let* ((info (upgraded-array-info element-type))
-         (array (make-simple-array-1 length info area)))
+(defun make-simple-array (length info area initial-element initial-element-p)
+  (let* ((array (make-simple-array-1 length info area)))
     (when initial-element-p
-      (unless (typep initial-element element-type)
-        (error 'type-error :expected-type element-type :datum initial-element))
+      (unless (typep initial-element (specialized-array-definition-type info))
+        (error 'type-error :expected-type (specialized-array-definition-type info) :datum initial-element))
       (unless (eql initial-element (specialized-array-definition-zero-element info))
         (fill array initial-element)))
     array))
@@ -245,6 +244,13 @@
     (1 `(funcall #'(setf aref-1) ,value ,array ,@subscripts))
     (2 `(funcall #'(setf aref-2) ,value ,array ,@subscripts))
     (3 `(funcall #'(setf aref-3) ,value ,array ,@subscripts))
+    (t whole)))
+
+(define-compiler-macro (cas aref) (&whole whole old new array &rest subscripts)
+  (case (length subscripts)
+    (1 `(funcall #'(cas aref-1) ,old ,new ,array ,@subscripts))
+    (2 `(funcall #'(cas aref-2) ,old ,new ,array ,@subscripts))
+    (3 `(funcall #'(cas aref-3) ,old ,new ,array ,@subscripts))
     (t whole)))
 
 (defun %make-array-header (tag storage fill-pointer info dimensions area)
@@ -353,8 +359,9 @@
   ;; n => (n)
   (when (not (listp dimensions))
     (setf dimensions (list dimensions)))
-  (let ((rank (length dimensions))
-        (upgraded-element-type (upgraded-array-element-type element-type)))
+  (let* ((rank (length dimensions))
+         (element-type-info (upgraded-array-info element-type))
+         (upgraded-element-type (specialized-array-definition-type element-type-info)))
     (when (>= rank array-rank-limit)
       (error "Array has too many dimensions."))
     (when (and initial-element-p initial-contents-p)
@@ -396,9 +403,7 @@
                 ;; character arrays are special.
                 (not (eql upgraded-element-type 'character)))
            ;; Create a simple 1D array.
-           (let ((array (if initial-element-p
-                            (make-simple-array (first dimensions) element-type area initial-element)
-                            (make-simple-array (first dimensions) element-type area))))
+           (let ((array (make-simple-array (first dimensions) element-type-info area initial-element initial-element-p)))
              (when initial-contents-p
                (initialize-from-initial-contents array initial-contents))
              array))
@@ -408,8 +413,7 @@
            (%make-array-header +object-tag-array+
                                memory
                                fill-pointer
-                               (specialized-array-definition-tag
-                                (upgraded-array-info element-type))
+                               (specialized-array-definition-tag element-type-info)
                                dimensions
                                area))
           (displaced-to
@@ -437,9 +441,7 @@
           (t (let* ((total-size (if (integerp dimensions)
                                     dimensions
                                     (apply #'* dimensions)))
-                    (backing-array (if initial-element-p
-                                       (make-simple-array total-size element-type area initial-element)
-                                       (make-simple-array total-size element-type area)))
+                    (backing-array (make-simple-array total-size element-type-info area initial-element initial-element-p))
                     (array (%make-array-header (if (and (not fill-pointer)
                                                         (not adjustable))
                                                    +object-tag-simple-array+
@@ -501,9 +503,13 @@
                   (replace new-array array)))
            new-array))
         ((%simple-1d-array-p array)
-         (let ((new-array (if initial-element-p
-                              (make-simple-array (first new-dimensions) (if element-type-p element-type (array-element-type array)) area initial-element)
-                              (make-simple-array (first new-dimensions) (if element-type-p element-type (array-element-type array)) area))))
+         (let ((new-array (make-simple-array (first new-dimensions)
+                                             (if element-type-p
+                                                 (upgraded-array-info element-type)
+                                                 (array-element-info array))
+                                             area
+                                             initial-element
+                                             initial-element-p)))
            (cond (initial-contents-p
                   (initialize-from-initial-contents new-array initial-contents))
                  (t
@@ -591,6 +597,21 @@
         (t ;; Normal arrays use the type of their storage simple array.
          (%simple-array-element-type (%complex-array-storage array)))))
 
+(defun array-element-info (array)
+  (check-type array array)
+  (cond ((%simple-1d-array-p array)
+         (%simple-array-info array))
+        ((character-array-p array)
+         *array-character-info*)
+        ((fixnump (%complex-array-storage array))
+         ;; Memory arrays have their type in the info field.
+         (upgraded-array-info (svref *array-types* (%complex-array-info array))))
+        ((%complex-array-info array)
+         ;; Displaced arrays inherit the type of the array they displace on.
+         (array-element-type (%complex-array-storage array)))
+        (t ;; Normal arrays use the type of their storage simple array.
+         (%simple-array-info (%complex-array-storage array)))))
+
 (defun array-has-fill-pointer-p (array)
   (check-type array array)
   (and (vectorp array)
@@ -617,7 +638,7 @@
 (defun check-vector-has-fill-pointer (vector)
   (unless (array-has-fill-pointer-p vector)
     (error 'simple-type-error
-           :expected-type 'vector
+           :expected-type '(and vector (satisfies array-has-fill-pointer-p))
            :datum vector
            :format-control "VECTOR ~S is not a VECTOR with a fill-pointer."
            :format-arguments (list vector))))
@@ -703,6 +724,25 @@
         (t ;; Normal array, backed by a simple array.
          (setf (%simple-array-aref (%complex-array-storage array) index) value))))
 
+(defun (cas %row-major-aref) (old new array index)
+  "(CAS ROW-MAJOR-AREF) with no bounds check."
+  (cond ((%simple-1d-array-p array)
+         (cas (%simple-array-aref array index) old new))
+        ((%complex-array-info array)
+         (cond ((fixnump (%complex-array-storage array))
+                ;; A memory array.
+                (cas (%memory-array-aref array index) old new))
+               (t
+                ;; A displaced array.
+                (cas (row-major-aref (%complex-array-storage array)
+                                     (+ index (%complex-array-info array)))
+                     old new))))
+        ((character-array-p array)
+         ;; TODO. The promotion from narrow backing arrays to wide backing arrays complicates this...
+         (error "CAS not supported on character arrays"))
+        (t ;; Normal array, backed by a simple array.
+         (cas (%simple-array-aref (%complex-array-storage array) index) old new))))
+
 (defun row-major-aref (array index)
   (check-type array array)
   (check-type index (integer 0) "a non-negative integer")
@@ -719,6 +759,14 @@
       (error "Row-major index ~S exceeds total size ~S of array ~S." index total-size array))
     (setf (%row-major-aref array index) value)))
 
+(defun (cas row-major-aref) (old new array index)
+  (check-type array array)
+  (check-type index (integer 0) "a non-negative integer")
+  (let ((total-size (array-total-size array)))
+    (when (>= index total-size)
+      (error "Row-major index ~S exceeds total size ~S of array ~S." index total-size array))
+    (cas (%row-major-aref array index) old new)))
+
 (defun aref (array &rest subscripts)
   (declare (dynamic-extent subscripts))
   (%row-major-aref array (apply #'array-row-major-index array subscripts)))
@@ -726,6 +774,10 @@
 (defun (setf aref) (value array &rest subscripts)
   (declare (dynamic-extent subscripts))
   (setf (%row-major-aref array (apply #'array-row-major-index array subscripts)) value))
+
+(defun (cas aref) (old new array &rest subscripts)
+  (declare (dynamic-extent subscripts))
+  (cas (%row-major-aref array (apply #'array-row-major-index array subscripts)) old new))
 
 (defun aref-1 (array index)
   (check-type index integer)
@@ -744,6 +796,15 @@
     (error "Index ~S out of bounds. Must be 0 <= n < ~D~%"
            index (array-dimension array 0)))
   (setf (%row-major-aref array index) value))
+
+(defun (cas aref-1) (old new array index)
+  (check-type index integer)
+  (unless (= (array-rank array) 1)
+    (error "Invalid number of indices to array ~S." array))
+  (when (>= index (array-dimension array 0))
+    (error "Index ~S out of bounds. Must be 0 <= n < ~D~%"
+           index (array-dimension array 0)))
+  (cas (%row-major-aref array index) old new))
 
 (defun aref-2 (array index1 index2)
   (check-type index1 integer)
@@ -772,6 +833,20 @@
            index2 (array-dimension array 1)))
   (let ((ofs (+ (* index1 (array-dimension array 1)) index2)))
     (setf (%row-major-aref array ofs) value)))
+
+(defun (cas aref-2) (old new array index1 index2)
+  (check-type index1 integer)
+  (check-type index2 integer)
+  (unless (= (array-rank array) 2)
+    (error "Invalid number of indices to array ~S." array))
+  (when (>= index1 (array-dimension array 0))
+    (error "Index ~S out of bounds. Must be 0 <= n < ~D~%"
+           index1 (array-dimension array 0)))
+  (when (>= index2 (array-dimension array 1))
+    (error "Index ~S out of bounds. Must be 0 <= n < ~D~%"
+           index2 (array-dimension array 1)))
+  (let ((ofs (+ (* index1 (array-dimension array 1)) index2)))
+    (cas (%row-major-aref array ofs) old new)))
 
 (defun aref-3 (array index1 index2 index3)
   (check-type index1 integer)
@@ -808,6 +883,24 @@
       (error "Index ~S out of bounds. Must be 0 <= n < ~D~%" index3 dim3))
     (let ((ofs (+ (* (+ (* index1 dim2) index2) dim3) index3)))
       (setf (%row-major-aref array ofs) value))))
+
+(defun (cas aref-3) (old new array index1 index2 index3)
+  (check-type index1 integer)
+  (check-type index2 integer)
+  (check-type index3 integer)
+  (unless (= (array-rank array) 3)
+    (error "Invalid number of indices to array ~S." array))
+  (let ((dim1 (array-dimension array 0))
+        (dim2 (array-dimension array 1))
+        (dim3 (array-dimension array 2)))
+    (when (>= index1 dim1)
+      (error "Index ~S out of bounds. Must be 0 <= n < ~D~%" index1 dim1))
+    (when (>= index2 dim2)
+      (error "Index ~S out of bounds. Must be 0 <= n < ~D~%" index2 dim2))
+    (when (>= index3 dim3)
+      (error "Index ~S out of bounds. Must be 0 <= n < ~D~%" index3 dim3))
+    (let ((ofs (+ (* (+ (* index1 dim2) index2) dim3) index3)))
+      (cas (%row-major-aref array ofs) old new))))
 
 (defun bit (bit-array &rest subscripts)
   (declare (dynamic-extent subscripts))

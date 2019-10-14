@@ -59,6 +59,10 @@ party to perform, the indicated option.")
 (defconstant +subnegotiation-send+ 1)
 (defconstant +subnegotiation-info+ 2)
 
+(defun vector-ub8 (&rest elements)
+  (declare (dynamic-extent elements))
+  (make-array (length elements) :element-type '(unsigned-byte 8) :initial-contents elements))
+
 (defun read-subnegotiation (connection)
   (let ((bytes (make-array 8 :element-type '(unsigned-byte 8)
                            :adjustable t :fill-pointer 0))
@@ -80,45 +84,45 @@ party to perform, the indicated option.")
              (data (read-subnegotiation connection)))
          (case option
            (#.+option-terminal-type+
-            (write-sequence (apply 'vector
+            (write-sequence (apply 'vector-ub8
                                    (append (list +command-iac+ +command-sb+ +option-terminal-type+ +subnegotiation-is+)
                                            (map 'list 'char-code (terminal-type telnet))
                                            (list +command-iac+ +command-se+)))
                             connection))
-           (t (write-sequence (vector +command-iac+ +command-sb+ option +subnegotiation-is+
-                                      +command-iac+ +command-se+)
+           (t (write-sequence (vector-ub8 +command-iac+ +command-sb+ option +subnegotiation-is+
+                                          +command-iac+ +command-se+)
                               connection)))))
       (#.+command-do+
        (let ((option (read-byte connection)))
          (case option
            (#.+option-terminal-type+
-            (write-sequence (vector +command-iac+ +command-will+
-                                    +option-terminal-type+)
+            (write-sequence (vector-ub8 +command-iac+ +command-will+
+                                        +option-terminal-type+)
                             connection))
            (#.+option-window-size+
             (when (eql option +option-window-size+)
               (setf (do-window-size-updates telnet) t))
             (send-window-size telnet))
-           (t (write-sequence (vector +command-iac+ +command-wont+ option)
+           (t (write-sequence (vector-ub8 +command-iac+ +command-wont+ option)
                               connection)))))
       (#.+command-dont+
        (let ((option (read-byte connection)))
          (when (eql option +option-window-size+)
            (setf (do-window-size-updates telnet) nil))
-         (write-sequence (vector +command-iac+ +command-wont+
-                                 option)
+         (write-sequence (vector-ub8 +command-iac+ +command-wont+
+                                     option)
                          connection)))
       (#.+command-will+
        (read-byte connection)
-       #+nil(write-sequence (vector +command-iac+ +command-wont+
-                                    (read-byte connection))))
+       #+nil(write-sequence (vector-ub8 +command-iac+ +command-wont+
+                                        (read-byte connection))))
       (#.+command-wont+
        (read-byte connection)
-       #+nil(write-sequence (vector +command-iac+ +command-wont+
-                                    (read-byte connection)))))))
+       #+nil(write-sequence (vector-ub8 +command-iac+ +command-wont+
+                                        (read-byte connection)))))))
 
 (defun send-window-size (telnet)
-  (write-sequence (apply 'vector
+  (write-sequence (apply 'vector-ub8
                          (append (list +command-iac+ +command-sb+ +option-window-size+)
                                  (let ((width (mezzano.gui.xterm:terminal-width (xterm telnet)))
                                        (height (mezzano.gui.xterm:terminal-height (xterm telnet))))
@@ -135,12 +139,9 @@ party to perform, the indicated option.")
    (%xterm :initarg :xterm :reader xterm)
    (%terminal-type :initarg :terminal-type :reader terminal-type)
    (%connection :initarg :connection :accessor connection)
-   (%receive-thread :initarg :receive-thread :accessor receive-thread)
-   (%do-window-size-updates :initarg :do-window-size-updates :accessor do-window-size-updates))
+   (%do-window-size-updates :initarg :do-window-size-updates :accessor do-window-size-updates)
+   (%last-was-cr :initform nil :accessor last-was-cr))
   (:default-initargs :connection nil))
-
-(defclass server-disconnect-event ()
-  ())
 
 (defun compute-telnet-window-size (font cwidth cheight)
   ;; Make a fake frame to get the frame size.
@@ -207,10 +208,6 @@ party to perform, the indicated option.")
                                            (write-byte +command-iac+ (connection telnet)))
                                          (write-byte (char-code ch) (connection telnet))))))
 
-(defmethod dispatch-event (telnet (event server-disconnect-event))
-  (setf (connection telnet) nil)
-  (telnet-write-string telnet (format nil "~%Disconnected from server")))
-
 (defmethod dispatch-event (app (event mezzano.gui.compositor:resize-request-event))
   (let ((old-width (mezzano.gui.compositor:width (window app)))
         (old-height (mezzano.gui.compositor:height (window app)))
@@ -244,36 +241,24 @@ party to perform, the indicated option.")
   (when (do-window-size-updates app)
     (send-window-size app)))
 
-(defun telnet-receive (telnet)
-  (handler-case
-      (let ((connection (connection telnet))
-            (xterm (xterm telnet))
-            (last-was-cr nil))
-        ;; Announce capabilities.
-        (write-sequence (vector +command-iac+ +command-do+ +option-suppress-go-ahead+
-                                +command-iac+ +command-will+ +option-window-size+)
-                        connection)
-        ;; FIXME: Translate from UTF-8 here. Can't use read-char on the tcp-stream because
-        ;; terminal IO happens on top of the binary telnet layer.
-        (loop
-           (when (not (connection telnet))
-             (return))
-           (let ((byte (read-byte connection)))
-             (cond ((eql byte +command-iac+)
-                    (let ((command (read-byte connection)))
-                      (if (eql command +command-iac+)
-                          (mezzano.gui.xterm:receive-char (xterm telnet) (code-char +command-iac+))
-                          (telnet-command telnet command))))
-                   ((eql byte #x0D) ; CR
-                    (setf last-was-cr t)
-                    (mezzano.gui.xterm:receive-char xterm (code-char byte)))
-                   ((and last-was-cr (eql byte #x00))
-                    (setf last-was-cr nil))
-                   (t (setf last-was-cr nil)
-                      (mezzano.gui.xterm:receive-char xterm (code-char byte)))))))
-    (end-of-file ()
-      (mezzano.supervisor:fifo-push (make-instance 'server-disconnect-event)
-                                    (fifo telnet)))))
+(defun telnet-receive-byte (telnet byte)
+  ;; FIXME: Translate from UTF-8 here. Can't use read-char on the tcp-stream because
+  ;; terminal IO happens on top of the binary telnet layer.
+  ;; FIXME: This does sync reads of the telnet stream when processing commands.
+  ;; If the server doesn't play nice this will block the UI.
+  (cond ((eql byte +command-iac+)
+         (let ((command (read-byte (connection telnet))))
+           (if (eql command +command-iac+)
+               (mezzano.gui.xterm:receive-char (xterm telnet) (code-char +command-iac+))
+               (telnet-command telnet command))))
+        ((eql byte #x0D) ; CR
+         (setf (last-was-cr telnet) t)
+         (mezzano.gui.xterm:receive-char (xterm telnet) (code-char byte)))
+        ((and (last-was-cr telnet) (eql byte #x00))
+         (setf (last-was-cr telnet) nil))
+        (t
+         (setf (last-was-cr telnet) nil)
+         (mezzano.gui.xterm:receive-char (xterm telnet) (code-char byte)))))
 
 (defvar *server-shortcuts*
   '(("nao" "nethack.alt.org")))
@@ -339,11 +324,33 @@ party to perform, the indicated option.")
               (unwind-protect
                    (progn
                      (setf server (find-server telnet server))
-                     (setf (connection telnet) (mezzano.network.tcp:tcp-stream-connect server port)
-                           (receive-thread telnet) (mezzano.supervisor:make-thread (lambda () (telnet-receive telnet))
-                                                                                   :name "Telnet receive"))
+                     (setf (connection telnet) (mezzano.network.tcp:tcp-stream-connect server port :element-type '(unsigned-byte 8)))
+                     ;; Announce capabilities.
+                     (write-sequence (vector-ub8 +command-iac+ +command-do+ +option-suppress-go-ahead+
+                                                 +command-iac+ +command-will+ +option-window-size+)
+                                     (connection telnet))
                      (setf (mezzano.gui.widgets:frame-title frame) (format nil "Telnet - ~A:~D" server port))
                      (mezzano.gui.widgets:draw-frame frame)
+                     ;; Main interaction loop, when connected to the server.
+                     (loop
+                        (when (not (connection telnet))
+                          (return))
+                        (mezzano.sync:wait-for-objects fifo (connection telnet))
+                        (loop
+                           for msg = (mezzano.supervisor:fifo-pop fifo nil)
+                           while msg
+                           do (dispatch-event telnet msg))
+                        (loop
+                           for byte = (sys.int::read-byte-no-hang (connection telnet) nil :eof)
+                           while byte
+                           do (cond ((eql byte :eof)
+                                     ;; Server disconnected
+                                     (setf (connection telnet) nil)
+                                     (telnet-write-string telnet (format nil "~%Disconnected from server"))
+                                     (return))
+                                    (t
+                                     (telnet-receive-byte telnet byte)))))
+                     ;; Post-connection interaction loop. Just processing compositor events.
                      (loop
                         (dispatch-event telnet (mezzano.supervisor:fifo-pop fifo))))
                 (when (connection telnet)

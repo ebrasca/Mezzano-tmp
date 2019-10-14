@@ -19,6 +19,8 @@
   (synchronized t)
   (lock (error "No lock provided.")))
 
+(declaim (inline %make-hash-table))
+
 (defun hash-table-size (hash-table)
   (ash (%object-header-data (hash-table-storage hash-table)) -1))
 
@@ -126,7 +128,7 @@
          (let ((current (hash-table-value-at hash-table slot)))
            (when (eq current old-value)
              (setf (hash-table-value-at hash-table slot) new-value))
-           currnet))
+           current))
         ;; Adding a new entry.
         ((or (and (eq (hash-table-key-at hash-table free-slot) *hash-table-unbound-value*)
                   (= (1+ (hash-table-used hash-table)) (hash-table-size hash-table)))

@@ -26,9 +26,11 @@
    (area :initarg :area :reader structure-definition-area)
    (size :initarg :size :reader structure-definition-size)
    (layout :initarg :layout :accessor structure-definition-layout)
-   (sealed :initarg :sealed :reader structure-definition-sealed)))
+   (sealed :initarg :sealed :reader structure-definition-sealed)
+   (docstring :initarg :docstring :reader structure-definition-docstring)
+   (has-standard-constructor :initarg :has-standard-constructor :reader structure-definition-has-standard-constructor)))
 
-(defun sys.int::%make-struct-definition (name slots parent area size layout sealed)
+(defun sys.int::%make-struct-definition (name slots parent area size layout sealed docstring has-standard-constructor)
   (make-instance 'structure-definition
                  :name name
                  :slots slots
@@ -36,7 +38,9 @@
                  :area area
                  :size size
                  :layout layout
-                 :sealed sealed))
+                 :sealed sealed
+                 :docstring docstring
+                 :has-standard-constructor has-standard-constructor))
 
 (defun sys.int::structure-definition-p (object)
   (typep object 'structure-definition))
@@ -49,8 +53,8 @@
   area
   instance-slots)
 
-(defun make-struct-definition (name slots parent area size layout sealed)
-  (let* ((def (sys.int::%make-struct-definition name slots parent area size nil sealed))
+(defun make-struct-definition (name slots parent area size layout sealed docstring has-standard-constructor)
+  (let* ((def (sys.int::%make-struct-definition name slots parent area size nil sealed docstring has-standard-constructor))
          (layout-object (make-layout
                          :class def
                          :obsolete nil
@@ -70,9 +74,10 @@
    (read-only :initarg :read-only :reader structure-slot-definition-read-only)
    (location :initarg :location :reader structure-slot-definition-location)
    (fixed-vector :initarg :fixed-vector :reader structure-slot-definition-fixed-vector)
-   (align :initarg :align :reader structure-slot-definition-align)))
+   (align :initarg :align :reader structure-slot-definition-align)
+   (documentation :initarg :documentation :reader structure-slot-definition-documentation)))
 
-(defun sys.int::make-struct-slot-definition (name accessor initform type read-only location fixed-vector align)
+(defun sys.int::make-struct-slot-definition (name accessor initform type read-only location fixed-vector align documentation)
   (make-instance 'structure-slot-definition
                  :name name
                  :accessor accessor
@@ -81,7 +86,8 @@
                  :read-only read-only
                  :location location
                  :fixed-vector fixed-vector
-                 :align align))
+                 :align align
+                 :documentation documentation))
 
 (defmethod print-object ((object structure-slot-definition) stream)
   (print-unreadable-object (object stream :type t :identity t)
@@ -93,7 +99,8 @@
                   :read-only (structure-slot-definition-read-only object)
                   :location (structure-slot-definition-location object)
                   :fixed-vector (structure-slot-definition-fixed-vector object)
-                  :align (structure-slot-definition-align object)))))
+                  :align (structure-slot-definition-align object)
+                  :documentation (structure-slot-definition-documentation object)))))
 
 (defstruct (instance-header
              (:constructor sys.c::%%make-instance-header
@@ -776,6 +783,8 @@
   (save-object (sys.int::layout-heap-layout (sys.int::structure-definition-layout object)) omap stream)
   ;; TODO: Include layout-instance-slots
   (save-object (sys.int::structure-definition-sealed object) omap stream)
+  (save-object (sys.int::structure-definition-docstring object) omap stream)
+  (save-object (sys.int::structure-definition-has-standard-constructor object) omap stream)
   (write-byte sys.int::+llf-structure-definition+ stream))
 
 (defmethod save-one-object ((object sys.int::layout) omap stream)
@@ -791,6 +800,7 @@
   (save-object (sys.int::structure-slot-definition-location object) omap stream)
   (save-object (sys.int::structure-slot-definition-fixed-vector object) omap stream)
   (save-object (sys.int::structure-slot-definition-align object) omap stream)
+  (save-object (sys.int::structure-slot-definition-documentation object) omap stream)
   (write-byte sys.int::+llf-structure-slot-definition+ stream))
 
 (defun sys.int::%single-float-as-integer (value)
@@ -1160,7 +1170,8 @@
 (defun save-compiler-builtins (path target-architecture)
   (format t ";; Writing compiler builtins to ~A.~%" path)
   (let* ((builtins (ecase target-architecture
-                     (:x86-64 (mezzano.compiler.codegen.x86-64:generate-builtin-functions))
+                     (:x86-64 (mezzano.compiler.backend.x86-64::generate-builtin-functions))
+                     #+(or)
                      (:arm64 (mezzano.compiler.codegen.arm64:generate-builtin-functions))))
          (*use-new-compiler* nil)
          (*target-architecture* target-architecture))
@@ -1205,7 +1216,7 @@
             (pathname-type p))))
 
 (defun function-inline-info (name)
-  (values (gethash name cross-support::*inline-modes*)
+  (values (eql (gethash name cross-support::*inline-modes*) t)
           (gethash name cross-support::*inline-forms*)))
 
 (defun sys.int::convert-structure-class-to-structure-definition (def)
@@ -1242,3 +1253,9 @@
 
 (defun mezzano.clos:ensure-class (name &rest initargs)
   (apply #'c2mop:ensure-class name initargs))
+
+(defun sys.int::known-declaration-p (declaration)
+  ;; The normal version also checks type specifiers, but I don't like that style.
+  ;; Always use (type foo ..)  over (foo ..)
+  (member declaration '(special constant sys.int::global inline notinline
+                        sys.int::maybe-inline type ftype declaration optimize)))

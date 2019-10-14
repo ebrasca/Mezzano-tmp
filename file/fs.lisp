@@ -18,7 +18,10 @@
            #:ensure-directories-exist-using-host
            #:rename-file-using-host
            #:file-write-date-using-host
+           #:file-author-using-host
            #:delete-file-using-host
+           #:delete-directory
+           #:delete-directory-using-host
            #:expunge-directory-using-host
            #:file-stream-pathname
            #:simple-file-error
@@ -71,6 +74,7 @@
     (t name)))
 
 (defun (setf find-host) (new-value name &optional errorp)
+  (declare (ignore errorp))
   (setf name (string-upcase (string name)))
   (assert (not (zerop (length name))))
   (cond (new-value
@@ -136,19 +140,26 @@
                    :version (if versionp version (pathname-version defaults)))))
 
 (defun pathname-host (pathname &key (case :local))
+  (declare (ignore case))
   (pathname-%host (pathname pathname)))
 (defun pathname-device (pathname &key (case :local))
+  (declare (ignore case))
   (pathname-%device (pathname pathname)))
 (defun pathname-directory (pathname &key (case :local))
+  (declare (ignore case))
   (pathname-%directory (pathname pathname)))
 (defun pathname-name (pathname &key (case :local))
+  (declare (ignore case))
   (pathname-%name (pathname pathname)))
 (defun pathname-type (pathname &key (case :local))
+  (declare (ignore case))
   (pathname-%type (pathname pathname)))
 (defun pathname-version (pathname &key (case :local))
+  (declare (ignore case))
   (pathname-%version (pathname pathname)))
 
 (defmethod make-load-form ((object pathname) &optional environment)
+  (declare (ignore environment))
   `(let ((host (find-host ',(host-name (pathname-host object)) t)))
      (make-pathname :host host
                     :device ',(pathname-device object)
@@ -215,10 +226,11 @@
   (host-name (pathname-host pathname)))
 
 (defun namestring (pathname)
-  (concatenate 'string
-               (string (host-name (pathname-host pathname)))
-               ":"
-               (namestring-using-host (pathname-host pathname) pathname)))
+  (let ((p (pathname pathname)))
+    (concatenate 'string
+                 (string (host-name (pathname-host p)))
+                 ":"
+                 (namestring-using-host (pathname-host p) p))))
 
 (defun file-namestring (pathname)
   (namestring-using-host (pathname-host pathname)
@@ -277,14 +289,15 @@
          (handler-case
              (format stream "#P~S" (namestring object))
            (no-namestring-error (c)
-               (print-unreadable-object (object stream :type t)
-                 (format stream "with no namestring ~S"
-                         (list :host (pathname-host object)
-                               :device (pathname-device object)
-                               :directory (pathname-directory object)
-                               :name (pathname-name object)
-                               :type (pathname-type object)
-                               :version (pathname-version object)))))))
+             (declare (ignore c))
+             (print-unreadable-object (object stream :type t)
+               (format stream "with no namestring ~S"
+                       (list :host (pathname-host object)
+                             :device (pathname-device object)
+                             :directory (pathname-directory object)
+                             :name (pathname-name object)
+                             :type (pathname-type object)
+                             :version (pathname-version object)))))))
         (t
          (print-unreadable-object (object stream :type t)
            (format stream "with no host ~S"
@@ -296,11 +309,16 @@
                          :version (pathname-version object)))))))
 
 (defun pathname (pathname)
-  (cond ((pathnamep pathname)
-         pathname)
-        ((typep pathname 'file-stream)
-         (pathname (file-stream-pathname pathname)))
-        (t (parse-namestring pathname))))
+  (typecase pathname
+    (pathname pathname)
+    (file-stream
+     (pathname (file-stream-pathname pathname)))
+    (synonym-stream
+     (pathname (sys.int::follow-synonym-stream pathname)))
+    (string
+     (parse-namestring pathname))
+    (t
+     (error 'type-error :datum pathname :expected-type 'pathname-designator))))
 
 (defgeneric stream-truename (stream))
 
@@ -595,6 +613,7 @@ NAMESTRING as the second."
 (defgeneric ensure-directories-exist-using-host (host pathname &key verbose))
 
 (defun ensure-directories-exist (pathspec &rest keys &key verbose &allow-other-keys)
+  (declare (ignore verbose))
   (let ((path (translate-logical-pathname (merge-pathnames pathspec))))
     (values pathspec
             (apply 'ensure-directories-exist-using-host
@@ -613,6 +632,8 @@ NAMESTRING as the second."
     (values dest source dest)))
 
 (defgeneric file-write-date-using-host (host path))
+(defmethod file-write-date-using-host (host path)
+  nil)
 
 (defun file-write-date (pathspec)
   (let ((path (translate-logical-pathname (merge-pathnames pathspec))))
@@ -620,6 +641,8 @@ NAMESTRING as the second."
     (file-write-date-using-host (pathname-host path) path)))
 
 (defgeneric file-author-using-host (host path))
+(defmethod file-author-using-host (host path)
+  nil)
 
 (defun file-author (pathspec)
   (let ((path (translate-logical-pathname (merge-pathnames pathspec))))
@@ -633,6 +656,13 @@ NAMESTRING as the second."
     (assert (not (wild-pathname-p path)))
     (apply #'delete-file-using-host (pathname-host path) path args))
   t)
+
+(defgeneric delete-directory-using-host (host path &key recursive))
+
+(defun delete-directory (pathspec &rest args &key &allow-other-keys)
+  (let ((path (translate-logical-pathname (merge-pathnames pathspec))))
+    (assert (not (wild-pathname-p path)))
+    (apply #'delete-directory-using-host (pathname-host path) path args)))
 
 (defgeneric expunge-directory-using-host (host path &key))
 

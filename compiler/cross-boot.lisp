@@ -72,15 +72,44 @@
       (setf (gethash name *inline-forms*) source-lambda))
   nil)
 
-(defmacro sys.int::cas (place old new)
-  (declare (ignore place old new))
-  `(error "Cross-cas not supported"))
+(defun cas-hash-table (key hash-table default old new)
+  ;; This isn't a truely thread-safe implementation, but the cold
+  ;; generator is single threaded anyway.
+  (let ((existing (gethash key hash-table default)))
+    (when (eql old existing)
+      (setf (gethash key hash-table) new))
+    existing))
 
-(defun sys.int::%defun (name lambda)
+(defmacro sys.int::cas (place old new)
+  ;; As a special cross-build exception, support hash-tables.
+  (cond ((and (consp place)
+              (eql (first place) 'gethash))
+         (destructuring-bind (key hash-table &optional default)
+             (rest place)
+           `(cas-hash-table ,key ,hash-table ,default ,old ,new)))
+        (t
+         `(error "Cross-cas ~S not supported" place))))
+
+(defun sys.int::%defun (name lambda &optional documentation)
+  (declare (ignore documentation))
   ;; Completely ignore CAS functions when cross compiling, they're not needed.
   (unless (and (consp name) (eql (first name) 'sys.int::cas))
     (setf (fdefinition name) lambda))
   name)
+
+(defun fboundp (name)
+  (if (and (consp name) (eql (first name) 'sys.int::cas))
+      nil
+      (cl:fboundp name)))
+
+(defun sys.int::set-variable-docstring (name docstring)
+  (declare (ignore name docstring)))
+
+(defun sys.int::set-setf-docstring (name docstring)
+  (declare (ignore name docstring)))
+
+(defun sys.int::set-type-docstring (name docstring)
+  (declare (ignore name docstring)))
 
 (defvar *variable-types* (make-hash-table))
 
@@ -152,6 +181,9 @@
     (notinline
      (dolist (name (rest declaration-specifier))
        (setf (gethash name *inline-modes*) nil)))
+    (sys.int::maybe-inline
+     (dolist (name (rest declaration-specifier))
+       (setf (gethash name *inline-modes*) :maybe)))
     (type
      (destructuring-bind (typespec &rest vars)
          (rest declaration-specifier)

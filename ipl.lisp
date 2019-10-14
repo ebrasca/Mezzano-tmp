@@ -1,7 +1,7 @@
 ;;;; Copyright (c) 2011-2016 Henry Harrington <henry.harrington@gmail.com>
 ;;;; This code is licensed under the MIT license.
 
-(in-package :cl-user)
+(in-package :sys.int)
 
 ;; Fast eval mode.
 (setf sys.int::*eval-hook* 'mezzano.fast-eval:eval-in-lexenv)
@@ -23,13 +23,21 @@
 
 (defun sys.int::check-connectivity ()
   ;; Make sure that there's one network card.
-  (when (null mezzano.network.ethernet::*cards*)
+  (loop
+     with timeout = 30.0
+     do
+       (when (or mezzano.network.ip::*ipv4-interfaces*
+                 (minusp timeout))
+         (return))
+       (sleep 0.1)
+       (decf timeout 0.1))
+  (when (null mezzano.network.ip::*ipv4-interfaces*)
     (format t "No network cards detected!~%~
 Make sure there is a virtio-net NIC attached.~%")
     (return-from sys.int::check-connectivity))
-  (when (not (null (rest mezzano.network.ethernet::*cards*)))
+  (when (not (null (rest mezzano.network.ip::*ipv4-interfaces*)))
     (format t "Multiple network cards detected! Not supported, but trying anyway.~%"))
-  (format t "Using network card ~S.~%" (first mezzano.network.ethernet::*cards*))
+  (format t "Using network card ~S.~%" (first (first mezzano.network.ip::*ipv4-interfaces*)))
   ;; Check connectivity to the file-server.
   (let ((fs-address (mezzano.network.ip:make-ipv4-address sys.int::*file-server-host-ip*)))
     (format t "File server has address ~A, port ~D.~%" fs-address mezzano.file-system.remote::*default-remote-file-port*)
@@ -79,6 +87,19 @@ Make sure there is a virtio-net NIC attached.~%")
     :inherit-configuration))
 (eval (read-from-string "(push 'home-source-registry asdf:*default-source-registries*)"))
 
+(defun driver-source-registry ()
+  `(:SOURCE-REGISTRY
+    (:TREE ,(pathname (concatenate 'string "REMOTE:"
+                                   sys.int::*mezzano-source-path*
+                                   "drivers/")))
+    :INHERIT-CONFIGURATION))
+(eval (read-from-string "(push 'driver-source-registry asdf:*default-source-registries*)"))
+
+;; Sound driver.
+(sys.int::cal "sys:source;drivers;sound.lisp")
+#+x86-64
+(sys.int::cal "sys:source;drivers;intel-hda.lisp")
+
 ;; Split-sequence
 (require :split-sequence)
 
@@ -104,17 +125,22 @@ Make sure there is a virtio-net NIC attached.~%")
 ;; Swank doesn't really support logical pathname shenanigans.
 (load (merge-pathnames "slime/swank-loader.lisp" (user-homedir-pathname)))
 (eval (read-from-string "(swank-loader::init)"))
-(eval (read-from-string "(swank:create-server :style :spawn :dont-close t)"))
+(eval (read-from-string "(swank:create-server :style :spawn :dont-close t :interface \"0.0.0.0\")"))
+
+;; Non-supervisor disk code
+(sys.int::cal "sys:source;disk;package.lisp")
+(sys.int::cal "sys:source;disk;crc32.lisp")
+(sys.int::cal "sys:source;disk;guid.lisp")
+(sys.int::cal "sys:source;disk;disk.lisp")
+(sys.int::cal "sys:source;disk;partition.lisp")
 
 ;; And the GUI.
 (sys.int::cal "sys:source;gui;package.lisp")
 (sys.int::cal "sys:source;gui;colour.lisp")
 (sys.int::cal "sys:source;gui;surface.lisp")
 (sys.int::cal "sys:source;gui;blit.lisp")
-;; SIMD code requires use of the new compiler.
 #+x86-64
-(let ((sys.c::*use-new-compiler* t))
-  (sys.int::cal "sys:source;gui;blit-x86-64-simd.lisp"))
+(sys.int::cal "sys:source;gui;blit-x86-64-simd.lisp")
 #+arm64
 (sys.int::cal "sys:source;gui;blit-generic.lisp")
 (sys.int::cal "sys:source;gui;keymaps.lisp")
@@ -186,13 +212,20 @@ Make sure there is a virtio-net NIC attached.~%")
 (sys.int::cal "sys:source;gui;starfield.lisp")
 ;;(eval (read-from-string "(setf mezzano.gui.compositor:*screensaver-spawn-function* 'mezzano.gui.starfield:spawn)"))
 
+;; USB Driver
+(require :mezzano-usb)
+(require :mezzano-usb/class-drivers)
+(require :mezzano-usb/ohci)
+
 ;; Other stuff.
+(sys.int::cal "sys:source;drivers;intel-gma.lisp")
 (sys.int::cal "sys:source;file;cache.lisp")
-(sys.int::cal "sys:source;file;disk.lisp")
 (sys.int::cal "sys:source;file;fat32.lisp")
 (sys.int::cal "sys:source;file;ext4.lisp")
 (sys.int::cal "sys:source;file;http.lisp")
+(sys.int::cal "sys:source;net;http-demo.lisp")
 (sys.int::cal "sys:source;system;disassemble.lisp")
+(sys.int::cal "sys:source;system;lldb.lisp")
 
 ;; Load the desktop image and start the desktop.
 (sys.int::copy-file (merge-pathnames "19377769093_c9cb23b4d3_b.jpg" (user-homedir-pathname))
@@ -203,6 +236,7 @@ Make sure there is a virtio-net NIC attached.~%")
 (defvar sys.int::*init-file-path* "SYS:HOME;INIT.LISP")
 
 (defun sys.int::load-init-file ()
+  (sleep 0.5) ; give the network a little time to settle.
   (when (and (boundp 'sys.int::*init-file-path*)
              sys.int::*init-file-path*)
     (handler-case (load sys.int::*init-file-path*)

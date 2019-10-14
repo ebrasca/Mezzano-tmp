@@ -89,12 +89,13 @@
                                   'single-float-positive-infinity
                                   'double-float-positive-infinity)))
     (return-from write-float))
-  (when (< float 0.0)
+  (when (or (< float 0.0)
+            (eql (float -0.0 float) float))
     (write-char #\- stream)
     (setf float (- float)))
   (multiple-value-bind (integer-part decimal-part)
       (truncate float)
-    (write integer-part :stream stream :base 10)
+    (write integer-part :stream stream :base 10 :radix nil)
     (write-char #\. stream)
     ;; Print the decimal part number-by-number to ensure
     ;; proper leading zeros.
@@ -118,9 +119,9 @@
                                 (truncate val 10)
                               (frob quot (1+ digit-position))
                               (when (>= digit-position trailing-zeros)
-                                (write rem :stream stream :base 10))))))
+                                (write rem :stream stream :base 10 :radix nil))))))
                  (frob adjusted-decimal 0))))))
-  (when (not (eql (type-of float) *read-default-float-format*))
+  (when (not (typep float *read-default-float-format*))
     (etypecase float
       (single-float
        (write-string "F0" stream))
@@ -134,53 +135,54 @@
 
 (defun write-case-escaped-string (string stream)
   "Print STRING while obeying readtable case, *PRINT-CASE* and *PRINT-BASE*."
-  (ecase *print-case*
-    (:upcase
-     (let ((need-escaping (or (some (lambda (c)
-                                      (or (and (upper-case-p c)
-                                               (digit-char-p c *print-base*))
-                                          (member c '(#\| #\\))
-                                          (lower-case-p c)))
-                                    string)
-                              (zerop (length string)))))
+  (let ((need-escaping (or (some (lambda (c)
+                                   (or (and (upper-case-p c)
+                                            (digit-char-p c *print-base*))
+                                       (member c '(#\| #\\))
+                                       (lower-case-p c)))
+                                 string)
+                           (zerop (length string)))))
+    (ecase *print-case*
+      (:upcase
        (when need-escaping
          (write-char #\| stream))
        (write-string string stream)
        (when need-escaping
-         (write-char #\| stream))))
-    (:downcase
-     (let ((output-string (make-array (length string) :element-type 'character :adjustable t :fill-pointer 0)))
-       (dotimes (i (length string))
-         (let ((c (char string i)))
-           (cond ((or (and (upper-case-p c)
-                           (digit-char-p c *print-base*))
-                      (member c '(#\| #\\))
-                      (lower-case-p c))
-                  (vector-push-extend #\\ output-string)
-                  (vector-push-extend c output-string))
-                 (t
-                  (vector-push-extend (char-downcase c) output-string)))))
-       (write-string output-string stream)))))
+         (write-char #\| stream)))
+      (:downcase
+       (cond (need-escaping
+              (write-char #\| stream)
+              (write-string string stream)
+              (write-char #\| stream))
+             (t
+              (write-string (string-downcase string) stream))))
+      (:capitalize
+       (cond (need-escaping
+              (write-char #\| stream)
+              (write-string string stream)
+              (write-char #\| stream))
+             (t
+              (write-string (string-capitalize string) stream)))))))
 
 (defun write-symbol (object stream)
-  (cond ((or *print-escape* *print-readably*)
-         (cond ((null (symbol-package object))
-                (when *print-gensym*
-                  (write-string "#:" stream)))
-               ((keywordp object)
-                (write-char #\: stream))
-               (t (multiple-value-bind (symbol status)
-                      (find-symbol (symbol-name object) *package*)
-                    (unless (and status (eql symbol object))
-                      ;; Not accessible in the current package.
-                      (multiple-value-bind (symbol status)
-                          (find-symbol (symbol-name object) (symbol-package object))
-                        (write-case-escaped-string (package-name (symbol-package object)) stream)
-                        (write-char #\: stream)
-                        (when (not (eql status :external))
-                          (write-char #\: stream)))))))
-         (write-case-escaped-string (symbol-name object) stream))
-        (t (write-case-escaped-string (symbol-name object) stream))))
+  (when (or *print-escape* *print-readably*)
+    (cond ((null (symbol-package object))
+           (when *print-gensym*
+             (write-string "#:" stream)))
+          ((keywordp object)
+           (write-char #\: stream))
+          (t
+           (multiple-value-bind (symbol status)
+               (find-symbol (symbol-name object) *package*)
+             (unless (and status (eql symbol object))
+               ;; Not accessible in the current package.
+               (let ((status (nth-value 1 (find-symbol (symbol-name object)
+                                                       (symbol-package object)))))
+                 (write-case-escaped-string (package-name (symbol-package object)) stream)
+                 (write-char #\: stream)
+                 (when (not (eql status :external))
+                   (write-char #\: stream))))))))
+  (write-case-escaped-string (symbol-name object) stream))
 
 (defun write-ratio (object stream)
   (when *print-radix*
@@ -224,18 +226,17 @@
 
 (defun write-cons (object stream)
   (with-printer-level/length (stream)
-    (let ((length *print-length*))
-      (write-char #\( stream)
-      (when (output (car object))
-        (do ((i (cdr object) (cdr i)))
-            ((atom i)
-             (when i
-               (write-string " . " stream)
-               (write i :stream stream)))
-          (write-char #\Space stream)
-          (when (not (output (car i)))
-            (return))))
-      (write-char #\) stream))))
+    (write-char #\( stream)
+    (when (output (car object))
+      (do ((i (cdr object) (cdr i)))
+          ((atom i)
+           (when i
+             (write-string " . " stream)
+             (write i :stream stream)))
+        (write-char #\Space stream)
+        (when (not (output (car i)))
+          (return))))
+    (write-char #\) stream)))
 
 (defun write-vector (object stream)
   (with-printer-level/length (stream)
@@ -384,6 +385,7 @@
     object))
 
 (defmacro print-unreadable-object ((object stream &rest keys &key type identity) &body body)
+  (declare (ignore type identity))
   `(%print-unreadable-object ,(when body `(lambda () (progn ,@body))) ,object ,stream ,@keys))
 
 (defun %print-unreadable-object (fn object stream &key type identity)

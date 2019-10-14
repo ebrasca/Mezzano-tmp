@@ -3,13 +3,16 @@
 
 (defpackage :system.networking
   (:use :cl)
-  (:nicknames :sys.net)
+  (:nicknames :sys.net :mezzano.network)
   (:export #:copy-packet #:packet-length
            #:buffered-format
            #:send #:receive
+           #:local-endpoint
+           #:remote-endpoint
            #:disconnect
            #:resolve-address
-           #:octet))
+           #:octet
+           #:network-error))
 
 (defpackage :mezzano.network.ethernet
   (:use :cl)
@@ -22,6 +25,7 @@
            #:*ethernet-broadcast*
            #:transmit-packet
            #:transmit-ethernet-packet
+           #:ethernet-receive
            #:+ethertype-ipv4+
            #:+ethertype-arp+
            #:+ethertype-ipv6+))
@@ -45,6 +49,7 @@
                 #:octet)
   (:export #:make-ipv4-address
            #:format-ipv4-address
+           #:ipv4-address-to-string
            #:invalid-ipv4-address
            #:parse-ipv4-address
            #:ipv4-interface-address
@@ -53,6 +58,7 @@
            #:address-equal
            #:compute-ip-checksum
            #:compute-ip-partial-checksum
+           #:no-route-to-host
            #:ipv4-route
            #:add-route
            #:remove-route
@@ -64,7 +70,9 @@
            #:+ip-protocol-udp+
            #:ping-host
            #:+ipv4-broadcast-source+
-           #:+ipv4-broadcast-local-network+))
+           #:+ipv4-broadcast-local-network+
+           #:+ipv4-multicast-network+
+           #:ipv4-receive))
 
 (defpackage :mezzano.network.tcp
   (:use :cl)
@@ -72,18 +80,25 @@
                 #:ub16ref/be #:ub16ref/le
                 #:ub32ref/be #:ub32ref/le
                 #:ub64ref/be #:ub64ref/le)
+  (:local-nicknames (:gray :mezzano.gray))
   (:export #:tcp-stream-connect
            #:tcp-listen
-           #:tcp4-accept-connection
-           #:tcp4-decline-connection
-           #:wait-for-connections
+           #:tcp-accept
            #:close-tcp-listener
+           #:tcp-listener-local-port
+           #:tcp-listener-local-ip
+           #:tcp-connection-local-port
+           #:tcp-connection-local-ip
+           #:tcp-connection-remote-port
+           #:tcp-connection-remote-ip
+           #:tcp-stream-connection
            #:network-error
            #:connection-error
            #:connection-error-host
            #:connection-error-port
            #:connection-aborted
-           #:connection-timed-out))
+           #:connection-timed-out
+           #:connection-stale))
 
 (defpackage :mezzano.network.udp
   (:use :cl)
@@ -104,7 +119,9 @@
                 #:ub32ref/be #:ub32ref/le
                 #:ub64ref/be #:ub64ref/le)
   (:export #:resolve-address
-           #:*dns-servers*))
+           #:*dns-servers*
+           #:add-dns-server
+           #:remove-dns-server))
 
 (defpackage :mezzano.network.dhcp
   (:use :cl)

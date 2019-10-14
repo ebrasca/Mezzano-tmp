@@ -7,7 +7,8 @@
 
 (defclass method-combination ()
   ((%name :initarg :name :reader method-combination-name)
-   (%combiner :initarg :combiner :reader method-combination-combiner)))
+   (%combiner :initarg :combiner :reader method-combination-combiner)
+   (documentation :initform nil :initarg :documentation)))
 
 (defun register-method-combination (name combiner)
   (check-type name symbol)
@@ -190,6 +191,7 @@
 )
 
 (defun invalid-method-error (method format-control &rest format-arguments)
+  (declare (ignore method))
   (apply #'error format-control format-arguments))
 
 ;; Built-in method combinations.

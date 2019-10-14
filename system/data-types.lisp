@@ -34,6 +34,8 @@
 (defconstant +tag-fixnum-111+       #b1110)
 (defconstant +tag-gc-forward+       #b1111)
 
+(defconstant +tag-field+ (byte 4 0))
+
 (defconstant +immediate-tag+ (byte 2 4))
 (defconstant +immediate-tag-character+ #b00)
 (defconstant +immediate-tag-single-float+ #b01)
@@ -117,12 +119,13 @@
 (defconstant +object-tag-symbol-value-cell+       #b101110)
 (defconstant +object-tag-mmx-vector+              #b101111)
 (defconstant +object-tag-symbol+                  #b110000)
-;; Low two bits must match high two bits of +tag-instance-header+.
-(defconstant +object-tag-instance+                #b110001)
+;;#b110001
 ;;#b110010
 (defconstant +object-tag-sse-vector+              #b110011)
-;;#b110100
-;;#b110101
+(defconstant +object-tag-weak-pointer-vector+     #b110100)
+;; Low two bits must match high two bits of +tag-instance-header+.
+;; Must be one bit different from +object-tag-funcallable-instance+.
+(defconstant +object-tag-instance+                #b110101)
 (defconstant +object-tag-function-reference+      #b110110)
 (defconstant +object-tag-interrupt-frame+         #b110111)
 ;; Conses get an object header when allocated in a non-cons area, purely
@@ -132,11 +135,11 @@
 (defconstant +object-tag-cons+                    #b111000)
 (defconstant +object-tag-freelist-entry+          #b111001)
 (defconstant +object-tag-weak-pointer+            #b111010)
-(defconstant +first-misc-object-tag+ +object-tag-mmx-vector+)
-(defconstant +last-misc-object-tag+ +object-tag-weak-pointer+)
+;; Function objects.
 (defconstant +object-tag-delimited-continuation+  #b111011)
 (defconstant +object-tag-function+                #b111100)
 ;; Low two bits must match high two bits of +tag-instance-header+.
+;; Must be one bit different from +object-tag-instance+.
 (defconstant +object-tag-funcallable-instance+    #b111101)
 (defconstant +object-tag-closure+                 #b111110)
 (defconstant +first-function-object-tag+ +object-tag-delimited-continuation+)
@@ -146,10 +149,9 @@
 ;;; Layout of symbols.
 (defconstant +symbol-name+ 0)
 (defconstant +symbol-package+ 1)
-(defconstant +symbol-value+ 2)
-(defconstant +symbol-function+ 3)
-(defconstant +symbol-plist+ 4)
-(defconstant +symbol-type+ 5)
+(defconstant +symbol-value+ 2) ; actually the global symbol-value-cell
+(defconstant +symbol-function+ 3) ; actually an fref
+(defconstant +symbol-type+ 4)
 
 (defconstant +symbol-value-cell-symbol+ 1)
 (defconstant +symbol-value-cell-value+ 2)
@@ -289,7 +291,7 @@ When the page is written to, the corresponding dirty bit in the card table will 
 reserved on the disk, but no specific block has been allocated.")
 (defconstant +block-map-id-not-allocated+ 0)
 
-(defparameter *llf-version* 28)
+(defparameter *llf-version* 30)
 
 (defconstant +llf-arch-x86-64+ 1)
 (defconstant +llf-arch-arm64+ 2)

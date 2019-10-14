@@ -3,7 +3,7 @@
 ;;;; This implementation can read from ext2, ext3 and ext4.
 
 (defpackage :mezzano.ext4-file-system
-  (:use :cl :mezzano.file-system :mezzano.file-system-cache :mezzano.disk-file-system :iterate)
+  (:use :cl :mezzano.file-system :mezzano.file-system-cache :mezzano.disk :iterate)
   (:export)
   (:import-from #:sys.int
                 #:explode))
@@ -197,7 +197,7 @@
                    :collect (logand feature feature-incompat))))))
 
 (defun read-superblock (disk)
-  (let* ((superblock (read-sector disk 2 2))
+  (let* ((superblock (block-device-read-sector disk 2 2))
          (magic (sys.int::ub16ref/le superblock 56))
          (feature-incompat (sys.int::ub32ref/le superblock 96)))
     (check-magic magic)
@@ -319,14 +319,14 @@
 (defun block-size (disk superblock)
   "Take disk and superblock, return block size in disk sectors"
   (/ (ash 1024 (superblock-log-block-size superblock))
-     (mezzano.supervisor:disk-sector-size disk)))
+     (block-device-sector-size disk)))
 
 (defun read-block (disk superblock block-n &optional (n-blocks 1))
   (let* ((block-size (block-size disk superblock))
          (sector-n (* block-size
                       (if (= (superblock-log-block-size superblock) 1)
                           (1+ block-n) block-n))))
-    (read-sector disk sector-n (* n-blocks block-size))))
+    (block-device-read-sector disk sector-n (* n-blocks block-size))))
 
 (defun block-size-in-bytes (disk superblock)
   "Take disk and superblock, return block size in bytes"
@@ -345,9 +345,10 @@
   (* (index inode-n superblock) (superblock-inode-size superblock)))
 
 (defun n-block-groups (superblock)
-  (let ((tmp (ceiling (/ (superblock-inodes-count superblock) (superblock-inodes-per-group superblock)))))
-    (assert (= tmp (ceiling (/ (superblock-blocks-count superblock) (superblock-blocks-per-group superblock)))))
-    (ceiling (/ (superblock-blocks-count superblock) (superblock-blocks-per-group superblock)))))
+  (let ((n-block-groups (ceiling (/ (superblock-blocks-count superblock) (superblock-blocks-per-group superblock)))))
+    (assert (= (ceiling (/ (superblock-inodes-count superblock) (superblock-inodes-per-group superblock)))
+               n-block-groups))
+    n-block-groups))
 
 (defstruct block-group-descriptor
   (block-bitmap)
@@ -404,7 +405,7 @@
                     (with n-octets := (* block-group-size (n-block-groups superblock)))
                     (with block := (read-block disk superblock 1
                                                (/ n-octets
-                                                  (mezzano.supervisor:disk-sector-size disk)
+                                                  (block-device-sector-size disk)
                                                   (block-size disk superblock))))
                     (for offset :from 0 :below n-octets :by block-group-size)
                     (collecting (read-block-group-descriptor superblock block offset)))))
@@ -478,7 +479,7 @@
   (name nil :type string))
 
 (defun read-linked-directory-entry (block offset)
-  (let* ((name-len (aref block (+ 6 offset))))
+  (let ((name-len (aref block (+ 6 offset))))
     (make-linked-directory-entry :inode (sys.int::ub32ref/le block (+ 0 offset))
                                  :rec-len (sys.int::ub16ref/le block (+ 4 offset))
                                  :name-len name-len
@@ -702,8 +703,8 @@
                 (when (string= file-name (linked-directory-entry-name (read-linked-directory-entry block offset)))
                   (return-from find-file (linked-directory-entry-inode (read-linked-directory-entry block offset)))))))))
 
-(defclass ext-file-stream (sys.gray:fundamental-binary-input-stream
-                           sys.gray:fundamental-binary-output-stream
+(defclass ext-file-stream (mezzano.gray:fundamental-binary-input-stream
+                           mezzano.gray:fundamental-binary-output-stream
                            file-cache-stream
                            file-stream)
   ((pathname :initarg :pathname :reader file-stream-pathname)
@@ -711,11 +712,11 @@
    (file-inode :initarg :file-inode :accessor file-inode)
    (abort-action :initarg :abort-action :accessor abort-action)))
 
-(defclass ext-file-character-stream (sys.gray:fundamental-character-input-stream
-                                     sys.gray:fundamental-character-output-stream
+(defclass ext-file-character-stream (mezzano.gray:fundamental-character-input-stream
+                                     mezzano.gray:fundamental-character-output-stream
                                      file-cache-character-stream
                                      ext-file-stream
-                                     sys.gray:unread-char-mixin)
+                                     mezzano.gray:unread-char-mixin)
   ())
 
 (defmacro with-ext-host-locked ((host) &body body)
@@ -748,39 +749,36 @@
                (error ":create not implemented")))))
       (when (and (not created-file) (member direction '(:output :io)))
         (error ":output :io not implemented"))
-      (let ((stream (cond ((or (eql element-type :default)
-                               (subtypep element-type 'character))
-                           (assert (member external-format '(:default :utf-8))
-                                   (external-format))
-                           (make-instance 'ext-file-character-stream
-                                          :pathname pathname
-                                          :host host
-                                          :direction direction
-                                          :file-inode file-inode
-                                          :buffer buffer
-                                          :position file-position
-                                          :length file-length
-                                          :abort-action abort-action))
-                          ((and (subtypep element-type '(unsigned-byte 8))
-                                (subtypep '(unsigned-byte 8) element-type))
-                           (assert (eql external-format :default) (external-format))
-                           (make-instance 'ext-file-stream
-                                          :pathname pathname
-                                          :host host
-                                          :direction direction
-                                          :file-inode file-inode
-                                          :buffer buffer
-                                          :position file-position
-                                          :length file-length
-                                          :abort-action abort-action))
-                          (t (error "Unsupported element-type ~S." element-type)))))
-        stream))))
+      (cond ((or (eql element-type :default)
+                 (subtypep element-type 'character))
+             (make-instance 'ext-file-character-stream
+                            :pathname pathname
+                            :host host
+                            :direction direction
+                            :file-inode file-inode
+                            :buffer buffer
+                            :position file-position
+                            :length file-length
+                            :abort-action abort-action
+                            :external-format (sys.int::make-external-format 'character external-format)))
+            ((and (subtypep element-type '(unsigned-byte 8))
+                  (subtypep '(unsigned-byte 8) element-type))
+             (assert (eql external-format :default) (external-format))
+             (make-instance 'ext-file-stream
+                            :pathname pathname
+                            :host host
+                            :direction direction
+                            :file-inode file-inode
+                            :buffer buffer
+                            :position file-position
+                            :length file-length
+                            :abort-action abort-action))
+            (t (error "Unsupported element-type ~S." element-type))))))
 
 (defmethod probe-using-host ((host ext-host) pathname)
   (multiple-value-bind (inode-n) (find-file host pathname)
     (if inode-n t nil)))
 
-;; WIP
 (defmethod directory-using-host ((host ext-host) pathname &key)
   (let ((inode-n (find-file host pathname))
         (disk (partition host))

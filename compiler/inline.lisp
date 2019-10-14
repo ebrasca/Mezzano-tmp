@@ -6,8 +6,7 @@
 (in-package :sys.c)
 
 (defun inline-functions (lambda architecture)
-  (with-metering (:inlining)
-    (il-form lambda architecture)))
+  (il-form lambda architecture))
 
 (defgeneric il-form (form architecture))
 
@@ -93,24 +92,12 @@
   (il-implicit-progn (targets form) architecture)
   form)
 
-(defgeneric applicable-builtin-p (name target))
-
-(defmethod applicable-builtin-p (name (target x86-64-target))
-  (gethash name mezzano.compiler.codegen.x86-64::*builtins*))
-
-(defmethod applicable-builtin-p (name (target arm64-target))
-  (gethash name mezzano.compiler.codegen.arm64::*builtins*))
-
 (defun expand-inline-function (form name arg-list architecture)
   (multiple-value-bind (inlinep expansion)
       (function-inline-info name)
     (when (and (or inlinep
                    (eql (second (assoc name (ast-inline-declarations form))) 'inline))
-               (not (eql (second (assoc name (ast-inline-declarations form))) 'notinline))
-               ;; Don't inline builtin functions.
-               ;; There may be inlinable definitions available, but they're for the new compiler.
-               (or *use-new-compiler*
-                   (not (applicable-builtin-p name architecture))))
+               (not (eql (second (assoc name (ast-inline-declarations form))) 'notinline)))
       (flet ((make-inline-environment ()
                (extend-environment
                 nil
@@ -141,7 +128,6 @@
   (let ((inlined-form (expand-inline-function form (name form) (arguments form) architecture)))
     (cond (inlined-form
            (change-made)
-           (log-event :inlined-function)
            inlined-form)
           (t form))))
 

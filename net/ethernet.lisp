@@ -3,16 +3,12 @@
 
 (in-package :mezzano.network.ethernet)
 
-(defvar *cards* '())
-
 (defconstant +ethertype-ipv4+ #x0800)
 (defconstant +ethertype-arp+  #x0806)
 (defconstant +ethertype-ipv6+ #x86DD)
 
 (defparameter *ethernet-broadcast* (make-array 6 :element-type '(unsigned-byte 8)
                                                :initial-element #xFF))
-
-(defvar *ethernet-thread* nil)
 
 (defun ethernet-mac (nic)
   (let ((mac (make-array 6 :element-type '(unsigned-byte 8)))
@@ -22,6 +18,7 @@
     mac))
 
 (defun format-mac-address (stream mac &optional colon-p at-sign-p)
+  (declare (ignore colon-p at-sign-p))
   (format stream "~2,'0X:~2,'0X:~2,'0X:~2,'0X:~2,'0X:~2,'0X"
           (ldb (byte 8 0) mac)
           (ldb (byte 8 8) mac)
@@ -30,32 +27,24 @@
           (ldb (byte 8 32) mac)
           (ldb (byte 8 40) mac)))
 
-(defun receive-ethernet-packet (interface packet)
-  (let ((ethertype (ub16ref/be packet 12)))
-    (cond
-      ((eql ethertype +ethertype-arp+)
-       (mezzano.network.arp::arp-receive interface packet))
-      ((eql ethertype +ethertype-ipv4+)
-       (mezzano.network.ip::ipv4-receive interface packet 14 (length packet)))
-      ((eql ethertype +ethertype-ipv6+)
-       (format t "IPV6 isn't supported.~%"))
-      (t (format t "Unknown ethertype ~X.~%" ethertype)))))
+(defgeneric ethernet-receive (ethertype interface packet start end))
 
-(defun ethernet-thread ()
-  (loop
-     (sys.int::log-and-ignore-errors
-      (multiple-value-bind (packet nic)
-          (mezzano.driver.network-card:receive-packet)
-        (receive-ethernet-packet nic packet)))))
+(defmethod ethernet-receive (ethertype interface packet start end)
+  nil)
+
+(defun receive-ethernet-packet (interface packet)
+  (ethernet-receive (ub16ref/be packet 12) interface packet 14 (length packet)))
 
 (defun ethernet-loopback (interface packet)
-  ;; This is a bit hacky...
-  (mezzano.driver.network-card::device-received-packet
-   interface
-   (let ((loopback-packet (make-array (sys.net::packet-length packet)
-                                      :element-type '(unsigned-byte 8))))
-     (sys.net::copy-packet loopback-packet packet)
-     loopback-packet)))
+  ;; This is a bit hacky... (less than it was before!)
+  (let ((loopback-packet (make-array (sys.net::packet-length packet)
+                                     :element-type '(unsigned-byte 8))))
+    (sys.net::copy-packet loopback-packet packet)
+    (mezzano.sync.dispatch:dispatch-async
+     (lambda ()
+       (sys.int::log-and-ignore-errors
+         (receive-ethernet-packet interface loopback-packet)))
+     sys.net::*network-serial-queue*)))
 
 (defun transmit-ethernet-packet (interface destination ethertype packet)
   (let* ((ethernet-header (make-array 14 :element-type '(unsigned-byte 8)))

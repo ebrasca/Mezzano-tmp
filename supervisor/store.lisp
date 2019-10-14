@@ -102,6 +102,7 @@
         *store-freelist-metadata-freelist* md))
 
 (defun store-maybe-refill-metadata ()
+  (check-tlb-shootdown-not-in-progress)
   (when (and (not *store-freelist-recursive-metadata-allocation*)
              (< *store-freelist-n-free-metadata*
                 +store-freelist-metadata-soft-limit+))
@@ -313,6 +314,7 @@
   (loop
      (multiple-value-bind (last-entry-offset next-block)
          (process-one-freelist-block freelist-block)
+       (declare (ignore last-entry-offset))
        (when (not next-block)
          (return))
        (setf freelist-block next-block)))

@@ -120,7 +120,9 @@
      ;; Sleep til next boot.
      (%run-on-wired-stack-without-interrupts (sp fp)
       (let ((self (current-thread)))
-        (decf *snapshot-inhibit*)
+        ;; *SNAPSHOT-INHIBIT* is set to 1 during boot, decrement it
+        ;; and enable snapshotting now that all boot work has been done.
+        (sys.int::%atomic-fixnum-add-symbol '*snapshot-inhibit* -1)
         (acquire-global-thread-lock)
         (setf (thread-wait-item self) "Next boot"
               (thread-state self) :sleeping)
@@ -149,10 +151,10 @@
             *pseudo-atomic* nil
             sys.int::*known-finalizers* nil
             *big-wait-for-objects-lock* (place-spinlock-initializer)))
+    (initialize-early-platform)
     (when (boundp '*boot-id*)
       (setf (event-state *boot-id*) t))
     (setf *boot-id* (make-event :name 'boot-epoch))
-    (initialize-early-platform)
     (initialize-threads)
     (initialize-disk)
     (initialize-pager)

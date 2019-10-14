@@ -4,6 +4,7 @@
 (in-package #:file-server)
 
 (defparameter *default-file-server-port* 2599)
+(defparameter *idle-timeout* 60)
 
 (defvar *commands* (make-hash-table))
 (defvar *file-table*)
@@ -181,9 +182,9 @@
                        (if fn
                            (handler-case (funcall fn form)
                              (error-with-class (c)
-                               (format *client* "(~S ~S)"
-                                       (error-class c)
-                                       (format nil "~A" c)))
+                               (format *client* "(:error ~S ~S)"
+                                       (format nil "~A" c)
+                                       (error-class c)))
                              (error (c)
                                (format *client* "(:error ~S)"
                                        (format nil "~A" c))))
@@ -240,7 +241,8 @@
                                     :output t
                                     :auto-close t
                                     :external-format :utf-8
-                                    :element-type :default))
+                                    :element-type :default
+                                    :timeout *idle-timeout*))
                   (format t "Got a connection: ~S~%" client)
                   (handler-case (handle-client client)
                     (end-of-file ())))))

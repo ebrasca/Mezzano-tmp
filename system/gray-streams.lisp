@@ -3,6 +3,8 @@
 
 (defpackage :mezzano.gray
   (:use :cl)
+  ;; Deprecated - only exists because some external libraries may
+  ;; still refer to it.
   (:nicknames :sys.gray)
   (:export
    ;; Gray Streams classes.
@@ -36,7 +38,9 @@
    #:stream-write-sequence
    ;;; Binary stream methods.
    #:stream-read-byte
+   #:stream-read-byte-no-hang
    #:stream-write-byte
+   #:stream-listen-byte
    ;;; Character input stream methods.
    #:stream-peek-char
    #:stream-read-char-no-hang
@@ -57,13 +61,18 @@
    #:unread-char-mixin
    #:stream-display
    #:stream-open-p
+   #:external-format-string-length
    ))
 
-(in-package :sys.gray)
+(in-package :mezzano.gray)
+
+;;; The standard stream class.
+
+(defclass stream () ())
 
 ;;; Gray Streams classes.
 
-(defclass fundamental-stream (stream standard-object)
+(defclass fundamental-stream (stream)
   ((%openp :initform t :accessor stream-open-p))
   (:documentation "The base class for all Gray streams."))
 
@@ -118,7 +127,9 @@
 (defgeneric stream-force-output (stream))
 (defgeneric stream-write-sequence (stream seq &optional start end))
 (defgeneric stream-read-byte (stream))
+(defgeneric stream-read-byte-no-hang (stream))
 (defgeneric stream-write-byte (stream integer))
+(defgeneric stream-listen-byte (stream))
 (defgeneric stream-peek-char (stream))
 (defgeneric stream-read-char-no-hang (stream))
 (defgeneric stream-read-char (stream))
@@ -182,8 +193,14 @@
   (setf (stream-open-p stream) nil)
   t)
 
+(defmethod open-stream-p ((stream t))
+  (error 'type-error :expected-type 'stream :datum stream))
+
 (defmethod open-stream-p ((stream fundamental-stream))
   (stream-open-p stream))
+
+(defmethod input-stream-p ((stream t))
+  (error 'type-error :expected-type 'stream :datum stream))
 
 (defmethod input-stream-p ((stream fundamental-stream))
   'nil)
@@ -191,16 +208,22 @@
 (defmethod input-stream-p ((stream fundamental-input-stream))
   't)
 
+(defmethod output-stream-p ((stream t))
+  (error 'type-error :expected-type 'stream :datum stream))
+
 (defmethod output-stream-p ((stream fundamental-stream))
   'nil)
 
 (defmethod output-stream-p ((stream fundamental-output-stream))
   't)
 
+(defmethod interactive-stream-p ((stream t))
+  (error 'type-error :expected-type 'stream :datum stream))
+
 (defmethod interactive-stream-p ((stream fundamental-stream))
   'nil)
 
-(defmethod stream-element-type ((stream sys.gray:fundamental-character-stream))
+(defmethod stream-element-type ((stream fundamental-character-stream))
   'character)
 
 (defgeneric external-format-string-length (external-format string))
@@ -211,7 +234,7 @@
 (defmethod external-format-string-length ((external-format (eql :utf-8)) string)
   (length (sys.int::encode-utf-8-string string :eol-style :lf)))
 
-(defmethod stream-file-string-length ((stream sys.gray:fundamental-character-output-stream) string)
+(defmethod stream-file-string-length ((stream fundamental-character-output-stream) string)
   (external-format-string-length (stream-external-format stream) string))
 
 (defmethod stream-clear-input ((stream fundamental-input-stream))
@@ -225,6 +248,15 @@
 
 (defmethod stream-force-output ((stream fundamental-output-stream))
   nil)
+
+(defmethod stream-read-byte-no-hang ((stream fundamental-binary-input-stream))
+  (ecase (stream-listen-byte stream)
+    ((:eof) :eof)
+    ((t) (read-byte stream nil :eof))
+    ((nil) nil)))
+
+(defmethod stream-listen-byte ((stream fundamental-binary-input-stream))
+  t)
 
 (defmethod stream-peek-char ((stream fundamental-character-input-stream))
   (let ((ch (read-char stream nil :eof)))

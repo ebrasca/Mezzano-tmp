@@ -304,7 +304,7 @@ The total access width must be at least 8 bits and no larger than 128 bits."
                       `(the sse-vector (progn
                                          ,(sys.c::insert-bounds-check vector array-type index index-type :adjust (1- ,n-lanes))
                                          (sys.c::call ,',access-fn ,vector (sys.c::call sys.c::%fast-fixnum-* ,index ',',(/ width 8))))))
-                    (sys.c::define-transform (setf sse-vector-ref) ((sse-vector sse-vector) (vector ,type) (n-lanes (eql ,n-lanes)) (index fixnum index-type))
+                    (sys.c::define-transform (setf sse-vector-ref) ((sse-vector sse-vector) (vector ,type array-type) (n-lanes (eql ,n-lanes)) (index fixnum index-type))
                         ((:optimize (= safety 0) (= speed 3)))
                       `(the sse-vector (progn
                                          ,(sys.c::insert-bounds-check vector array-type index index-type :adjust (1- ,n-lanes))
@@ -700,10 +700,6 @@ The values in the other lanes of the vector are indeterminate and may not be zer
          (sse-vector
           (check-type rhs sse-vector)
           (,sse-function lhs rhs))))
-     (defun ,mmx-function (lhs rhs)
-       (,mmx-function lhs rhs))
-     (defun ,sse-function (lhs rhs)
-       (,sse-function lhs rhs))
      (eval-when (:compile-toplevel :load-toplevel :execute)
        (export ',name :mezzano.simd)
        (sys.c::define-transform ,name ((lhs mmx-vector) (rhs mmx-vector))
@@ -733,10 +729,6 @@ The values in the other lanes of the vector are indeterminate and may not be zer
              (sse-vector
               (check-type rhs (or sse-vector (unsigned-byte 8)))
               (,sse-function lhs rhs)))))
-     (defun ,mmx-function (lhs rhs)
-       (,mmx-function lhs rhs))
-     (defun ,sse-function (lhs rhs)
-       (,sse-function lhs rhs))
      (eval-when (:compile-toplevel :load-toplevel :execute)
        (export ',name :mezzano.simd)
        (sys.c::define-transform ,name ((lhs mmx-vector) (rhs mmx-vector))
@@ -763,8 +755,6 @@ The values in the other lanes of the vector are indeterminate and may not be zer
          (sse-vector
           (check-type rhs sse-vector)
           (,sse-function lhs rhs))))
-     (defun ,sse-function (lhs rhs)
-       (,sse-function lhs rhs))
      (eval-when (:compile-toplevel :load-toplevel :execute)
        (export ',name :mezzano.simd)
        (sys.c::define-transform ,name ((lhs sse-vector) (rhs sse-vector))
@@ -780,8 +770,6 @@ The values in the other lanes of the vector are indeterminate and may not be zer
        (etypecase value
          (sse-vector
           (,sse-function value))))
-     (defun ,sse-function (value)
-       (,sse-function value))
      (eval-when (:compile-toplevel :load-toplevel :execute)
        (export ',name :mezzano.simd)
        (sys.c::define-transform ,name ((value sse-vector))
@@ -798,8 +786,6 @@ The values in the other lanes of the vector are indeterminate and may not be zer
          (sse-vector
           (check-type rhs sse-vector)
           (,sse-function lhs rhs))))
-     (defun ,sse-function (lhs rhs)
-       (,sse-function lhs rhs))
      (eval-when (:compile-toplevel :load-toplevel :execute)
        (export ',name :mezzano.simd)
        (sys.c::define-transform ,name ((lhs sse-vector) (rhs sse-vector))

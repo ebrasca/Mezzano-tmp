@@ -4,6 +4,7 @@
 (in-package :mezzano.supervisor)
 
 (sys.int::defglobal *snapshot-in-progress* nil)
+(sys.int::defglobal *snapshot-state*)
 (sys.int::defglobal *snapshot-inhibit*)
 
 (sys.int::defglobal *snapshot-disk-request*)
@@ -342,7 +343,10 @@ Returns 4 values:
         (bml4-block nil)
         (previously-deferred-free-blocks nil))
     ;; Stop the world before taking the *VM-LOCK*. There may be PA threads waiting for pages.
-    (with-world-stopped
+    (with-world-stopped ()
+      (when (not (zerop *snapshot-inhibit*))
+        (set-snapshot-light nil)
+        (return-from take-snapshot :retry))
       (with-mutex (*vm-lock*)
         (debug-print-line "deferred blocks: " *store-freelist-n-deferred-free-blocks*)
         (debug-print-line "Copying wired area.")
@@ -381,10 +385,16 @@ Returns 4 values:
 
 (defun snapshot-thread ()
   (loop
-     (when (zerop *snapshot-inhibit*)
-       (take-snapshot))
+     ;; Retry occurs when *SNAPSHOT-INHIBIT* is non-zero.
+     (loop
+        while (eql (take-snapshot) :retry)
+        do (sleep 0.1))
      ;; After taking a snapshot, clear *snapshot-in-progress*
      ;; and go back to sleep.
+     ;; FIXME: There's a race between setting this event and the thread
+     ;; going to sleep. (SETF EVENT-STATE) can't be called with the
+     ;; global thread-lock held.
+     (setf (event-state *snapshot-state*) t)
      (%disable-interrupts)
      (acquire-global-thread-lock)
      (setf *snapshot-in-progress* nil)
@@ -411,6 +421,9 @@ Returns 4 values:
    :sparse sparse))
 
 (defun initialize-snapshot ()
+  (when (not (boundp '*snapshot-state*))
+    (setf *snapshot-state* (make-event :name 'snapshot-not-in-progress)))
+  (setf (event-state *snapshot-state*) nil)
   (setf *snapshot-disk-request* (make-disk-request))
   (setf *snapshot-in-progress* nil)
   (setf *snapshot-inhibit* 1)
@@ -434,19 +447,26 @@ Returns 4 values:
   (sys.int::gc :full t)
   ;; Attempt to wake the snapshot thread, only waking it if
   ;; there is not snapshot currently in progress.
+  ;; FIXME: locking for SMP.
   (let ((did-wake (safe-without-interrupts ()
                       (let ((was-in-progress (sys.int::cas (sys.int::symbol-global-value '*snapshot-in-progress*) nil t)))
                         (when (eql was-in-progress nil)
+                          (setf (event-state *snapshot-state*) nil)
                           (wake-thread sys.int::*snapshot-thread*)
                           t)))))
     (when did-wake
       (thread-yield))))
 
+(defun wait-for-snapshot-completion ()
+  "If a snapshot is currently being take, then wait for it to complete."
+  (event-wait *snapshot-state*))
+
 (defmacro with-snapshot-inhibited (options &body body)
   `(call-with-snapshot-inhibited (dx-lambda () ,@body) ,@options))
 
 (defun call-with-snapshot-inhibited (fn)
-  (incf *snapshot-inhibit*)
+  ;; FIXME: Switch to ATOMIC-INCF/-DECF. Needs xcompiler fixes for declaim.
+  (sys.int::%atomic-fixnum-add-symbol '*snapshot-inhibit* 1)
   (unwind-protect
        (funcall fn)
-    (decf *snapshot-inhibit*)))
+    (sys.int::%atomic-fixnum-add-symbol '*snapshot-inhibit* -1)))

@@ -7,9 +7,8 @@
 
 (defun simplify (lambda architecture)
   (declare (ignore architecture))
-  (with-metering (:simplify-ast)
-    (detect-uses lambda)
-    (simp-form lambda)))
+  (detect-uses lambda)
+  (simp-form lambda))
 
 (defgeneric simp-form (form))
 
@@ -762,25 +761,27 @@
 
 (defun extract-list-like-forms (form)
   "If FORM is a list-like series of calls, then return the objects that would form the elements of the list.
-First return value is a list of elements, second is the final dotted component (if any)."
+First return value is a list of elements, second is the final dotted component (if any), third is true if a dynamic extent list is involved at any point."
   (setf form (unwrap-the form))
   (typecase form
     (ast-call
      (case (name form)
-       ((list)
-        (values (arguments form) nil))
-       ((list*)
-        (multiple-value-bind (tail-components tail-tail)
+       ((list dx-list)
+        (values (arguments form) nil (eql (name form) 'dx-list)))
+       ((list* dx-list*)
+        (multiple-value-bind (tail-components tail-tail dx-p)
             (extract-list-like-forms (first (last (arguments form))))
           (values (append (butlast (arguments form))
                           tail-components)
-                  tail-tail)))
+                  tail-tail
+                  (or dx-p (eql (name form) 'dx-list*)))))
        ((cons)
-        (multiple-value-bind (tail-components tail-tail)
+        (multiple-value-bind (tail-components tail-tail dx-p)
             (extract-list-like-forms (second (arguments form)))
           (values (append (list (first (arguments form)))
                           tail-components)
-                  tail-tail)))
+                  tail-tail
+                  dx-p)))
        ((copy-list)
         (extract-list-like-forms (first (arguments form))))
        (t
@@ -1184,11 +1185,11 @@ First return value is a list of elements, second is the final dotted component (
          (change-made)
          (first (arguments form)))
         ;; (list* x . y) => (cons x (list* . y))
-        ((and (eql (name form) 'list)
+        ((and (eql (name form) 'list*)
               (rest (arguments form)))
          (change-made)
          (ast `(call cons ,(first (arguments form))
-                     (call list ,@(rest (arguments form))))
+                     (call list* ,@(rest (arguments form))))
               form))
         ;; (%struct-slot s 'def 'slot) => fast-reader
         ((and (eql (name form) 'sys.int::%struct-slot)

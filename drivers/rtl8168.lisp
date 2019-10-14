@@ -138,7 +138,7 @@
 (defun rtl8168-pci-register (location)
   (let ((nic (make-instance 'rtl8168
                             :pci-location location
-                            :io-base (pci:pci-io-region location 2 256)
+                            :io-base (pci:pci-io-region location 2)
                             :irq (pci:pci-intr-line location))))
     (setf (rtl8168-tx-mailbox nic) (sync:make-mailbox :name `(tx-mailbox ,nic)))
     (setf (rtl8168-worker-thread nic)
@@ -299,7 +299,7 @@
   (nic:register-network-card nic)
   t)
 
-(defmethod nic:device-transmit-packet ((nic rtl8168) packet)
+(defmethod nic:transmit-packet ((nic rtl8168) packet)
   (let* ((len (loop for elt in packet
                  summing (length elt)))
          (data (make-array len
@@ -323,6 +323,9 @@
           0
           0))
 
+(defun tx-descriptors-available-p (nic)
+  (not (eql (rtl8168-tx-used-count nic) +rtl8168-n-tx-descriptors+)))
+
 (defun rtl8168-worker (nic)
   (when (not (rtl8168-initialize nic))
     (return-from rtl8168-worker))
@@ -334,9 +337,13 @@
          (loop
             ;; Wait for something to happen.
             ;; Either an interrupt, a request to send, or the device's boot epoch expiring.
-            (sync:wait-for-objects (rtl8168-irq-handler nic)
-                                   (rtl8168-tx-mailbox nic)
-                                   (rtl8168-boot-id nic))
+            (if (tx-descriptors-available-p nic)
+                (sync:wait-for-objects (rtl8168-irq-handler nic)
+                                       (rtl8168-tx-mailbox nic)
+                                       (rtl8168-boot-id nic))
+                ;; Don't look in the TX mailbox if all descriptors are full.
+                (sync:wait-for-objects (rtl8168-irq-handler nic)
+                                       (rtl8168-boot-id nic)))
             ;; Perform receive handling. Remove packets from the RX ring
             ;; until there are none left.
             (loop
@@ -372,9 +379,9 @@
                  (setf (rtl8168-rx-current nic) (rem (1+ current) +rtl8168-n-rx-descriptors+))))
             ;; Transmit handling.
             ;; Recover free descriptors.
-            (with-rt8168-access (nic)
+            (with-rtl8168-access (nic)
               (loop
-                 (when (eql (rtl8168-tx-current nic) (rtl8168-tx-tail nic))
+                 (when (eql (rtl8168-tx-used-count nic) 0)
                    ;; All pending descriptors processed.
                    (return))
                  (when (logbitp +rtl8168-descriptor-OWN+ (rtl8168-tx-desc-flags nic (rtl8168-tx-tail nic)))
@@ -386,7 +393,7 @@
                  #+(or)(debug-print-line "RTL8168 transmitted packet on descriptor " (rtl8168-tx-tail nic))))
             ;; Send pending packets.
             (loop
-               (when (eql (rtl8168-tx-used-count nic) +rtl8168-n-tx-descriptors+)
+               (when (not (tx-descriptors-available-p nic))
                  ;; Don't transmit when there are no free descriptors.
                  #+(or)(debug-print-line "RTL8168 not transmitting - no free descriptors.")
                  (return))
@@ -395,7 +402,7 @@
                  (when (not to-send)
                    (return))
                  #+(or)(debug-print-line "RTL8168 transmitting packet " to-send " on descriptor " current)
-                 (with-rt8168-access (nic)
+                 (with-rtl8168-access (nic)
                    ;; Copy packet to buffer.
                    (let ((address (+ (rtl8168-tx-bounce-virt nic)
                                      (* current (mezzano.supervisor::align-up +rtl8168-mtu+ 128)))))

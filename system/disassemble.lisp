@@ -20,9 +20,30 @@
 (defun disassemble (fn)
   (disassemble-function fn))
 
+(defun defmethod-name-to-method (defmethod-name)
+  "Convert a (DEFMETHOD name {qualifiers} (specializers...)) name to a method object."
+  (let* ((name (second defmethod-name))
+         (qualifiers (subseq defmethod-name 2 (1- (length defmethod-name))))
+         (specializers (loop
+                          for spec in (first (last defmethod-name))
+                          collect (cond ((symbolp spec)
+                                         (find-class spec))
+                                        ((and (consp spec)
+                                              (eql (first spec) 'eql))
+                                         `(eql ,(eval (second spec))))
+                                        (t
+                                         (error "Unknown specializer ~S" spec)))))
+         (generic (fdefinition name)))
+    (when (not (typep generic 'generic-function))
+      (error "Can't resolve ~S: ~S is not a generic-function"
+             defmethod-name generic))
+    (find-method generic qualifiers specializers)))
+
 (defun disassemble-function (fn &key (gc-metadata *print-gc-metadata*) (debug-metadata *print-debug-metadata*) architecture)
   (when (and (consp fn) (eql (first fn) 'lambda))
     (setf fn (compile nil fn)))
+  (when (and (consp fn) (eql (first fn) 'defmethod))
+    (setf fn (mezzano.clos:method-function (defmethod-name-to-method fn))))
   (when (not (functionp fn))
     (setf fn (fdefinition fn)))
   (check-type fn function)
@@ -66,8 +87,7 @@
                    (sys.int::decode-precise-debug-info
                     function
                     (sys.int::debug-info-precise-variable-data
-                     (sys.int::function-debug-info function)))))
-        (true-end (sys.int::function-code-size function)))
+                     (sys.int::function-debug-info function))))))
     (loop
        for decoded across (context-instructions context)
        do
@@ -286,6 +306,9 @@
       (dolist (an annotations)
         (format t ", ~A" an)))))
 
+(defun decode-seg (reg)
+  (elt #(:es :cs :ss :ds :fs :gs :invalid :invalid) reg))
+
 (defun decode-gpr8 (reg rex-field)
   (elt #(:al :cl :dl :bl :spl :bpl :sil :dil
          :r8l :r9l :r10l :r11l :r12l :r13l :r14l :r15l)
@@ -439,7 +462,6 @@
   ;; Returns reg, r/m, len.
   ;; r/m will either be an undecoded register or a decoded effective address.
   (let* ((modr/m (consume-ub8 context))
-         (mod (ldb +modr/m-mod+ modr/m))
          (rex-b (rex-b info))
          (rex-x (rex-x info))
          (asize (getf info :asize)))
@@ -700,9 +722,9 @@
     (decode-ev-gv sys.lap-x86:mov16 sys.lap-x86:mov32 sys.lap-x86:mov64)
     (decode-gb-eb sys.lap-x86:mov8)
     (decode-gv-ev sys.lap-x86:mov16 sys.lap-x86:mov32 sys.lap-x86:mov64)
-    (decode-ev-sw sys.lap-x86:movseg)
+    (decode-ev-sw)
     (decode-gv-ev nil sys.lap-x86:lea32 sys.lap-x86:lea64)
-    (decode-sw-ew sys.lap-x86:movseg)
+    (decode-sw-ev)
     (decode-group-1a)
     (decode-xchg+r) ; 90
     (decode-xchg+r)
@@ -1143,6 +1165,11 @@
                     (decode-gpr64 (ldb (byte 3 0) (getf info :opcode))
                                   (rex-b info))))
 
+(defun decode-ib (context info opcode)
+  (declare (ignore info))
+  (make-instruction opcode
+                    (consume-sb8 context)))
+
 (defun decode-iz (context info opcode)
   (declare (ignore info))
   (make-instruction opcode
@@ -1180,8 +1207,32 @@
 (define-modr/m-decoder decode-ev-gv (context info opcode r/m reg)
   (make-instruction opcode r/m reg))
 
+(defun decode-ev-sw (context info)
+  (multiple-value-bind (reg r/m)
+      (disassemble-modr/m context info)
+    (make-instruction 'sys.lap-x86:movseg
+                      (ecase (operand-size info)
+                        (64 (decode-gpr64-or-mem r/m (rex-b info)))
+                        (32 (decode-gpr32-or-mem r/m (rex-b info)))
+                        (16 (decode-gpr16-or-mem r/m (rex-b info))))
+                      (decode-seg reg))))
+
+(defun decode-sw-ev (context info)
+  (multiple-value-bind (reg r/m)
+      (disassemble-modr/m context info)
+    (make-instruction 'sys.lap-x86:movseg
+                      (decode-seg reg)
+                      (ecase (operand-size info)
+                        (64 (decode-gpr64-or-mem r/m (rex-b info)))
+                        (32 (decode-gpr32-or-mem r/m (rex-b info)))
+                        (16 (decode-gpr16-or-mem r/m (rex-b info)))))))
+
 (define-modr/m-decoder decode-gv-ev-ib (context info opcode r/m reg)
   (let ((imm (consume-sb8 context)))
+    (make-instruction opcode reg r/m imm)))
+
+(define-modr/m-decoder decode-gv-ev-iz (context info opcode r/m reg)
+  (let ((imm (consume-sb32/le context)))
     (make-instruction opcode reg r/m imm)))
 
 (define-modr/m-decoder decode-gv-ev (context info opcode r/m reg)
@@ -1483,6 +1534,7 @@
                             (consume-sb16/le context))))))
 
 (defun decode-al-ob (context info opcode)
+  (declare (ignore info))
   (make-instruction opcode
                     :al
                     (make-instance 'effective-address
@@ -1500,6 +1552,7 @@
                                      :disp (consume-sb64/le context)))))
 
 (defun decode-ob-al (context info opcode)
+  (declare (ignore info))
   (make-instruction opcode
                     (make-instance 'effective-address
                                    :disp (consume-sb64/le context))

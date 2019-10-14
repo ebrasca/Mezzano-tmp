@@ -34,6 +34,10 @@
 
 (in-package :mezzano.clos)
 
+(defconstant +slot-unbound+ '+slot-unbound+
+  "This value can be passed to (CAS SLOT-VALUE) to indicate that
+the old or new values are expected to be unbound.")
+
 ;;;
 ;;; Standard instances
 ;;;
@@ -101,21 +105,26 @@
 (sys.int::defglobal *standard-class-default-initargs-location*)
 (sys.int::defglobal *standard-effective-slot-definition-location-location*)
 (sys.int::defglobal *standard-effective-slot-definition-name-location*)
+(sys.int::defglobal *built-in-class-precedence-list-location*)
 
 (defun standard-instance-access (instance location)
   (if (consp location)
       (cdr location)
-      (mezzano.runtime::instance-access instance location)))
+      ;; Bypass INSTANCE-ACCESS because we know all locations in
+      ;; standard instances have type T
+      (sys.int::%object-ref-t instance (mezzano.runtime::location-offset-t location))))
 
 (defun (setf standard-instance-access) (new-value instance location)
   (if (consp location)
       (setf (cdr location) new-value)
-      (setf (mezzano.runtime::instance-access instance location) new-value)))
+      (setf (sys.int::%object-ref-t instance (mezzano.runtime::location-offset-t location))
+            new-value)))
 
 (defun (sys.int::cas standard-instance-access) (old new instance location)
   (if (consp location)
       (sys.int::cas (cdr location) old new)
-      (sys.int::cas (mezzano.runtime::instance-access instance location) old new)))
+      (sys.int::cas (sys.int::%object-ref-t instance (mezzano.runtime::location-offset-t location))
+                    old new)))
 
 ;; Instance and funcallable instances are accessed in the same way,
 ;; these are provided for compatibility with other MOP implementations.
@@ -268,6 +277,14 @@
         (t
          whole)))
 
+(defun check-slot-type (value instance slot-name)
+  (let* ((effective-slot (find-effective-slot instance slot-name))
+         (typecheck (safe-slot-definition-typecheck effective-slot)))
+    (when (and typecheck (not (funcall typecheck value)))
+      (error 'type-error
+             :datum value
+             :expected-type (safe-slot-definition-type effective-slot)))))
+
 (defun (setf std-slot-value) (value instance slot-name)
   (multiple-value-bind (slots location)
       (slot-location-in-instance instance slot-name)
@@ -275,6 +292,7 @@
       (slot-missing (class-of instance) instance slot-name 'setf value)
       (return-from std-slot-value
         value))
+    (check-slot-type value instance slot-name)
     (setf (standard-instance-access slots location) value)))
 (defun (setf slot-value) (new-value object slot-name)
   (cond ((std-class-p (class-of (class-of object)))
@@ -336,7 +354,17 @@
     (when (not location)
       (return-from std-slot-value
         (slot-missing (class-of instance) instance slot-name 'sys.int::cas (list old new))))
-    (sys.int::cas (standard-instance-access slots location) old new)))
+    (when (not (eql new '+slot-unbound+))
+      (check-slot-type new instance slot-name))
+    (let* ((real-old (if (eql old '+slot-unbound+) *secret-unbound-value* old))
+           (real-new (if (eql new '+slot-unbound+) *secret-unbound-value* new))
+           (prev (sys.int::cas (standard-instance-access slots location) real-old real-new)))
+      (cond ((eql prev *secret-unbound-value*)
+             (if (eql old '+slot-unbound+)
+                 '+slot-unbound+
+                 (values (slot-unbound (class-of instance) instance slot-name))))
+            (t
+             prev)))))
 (defun (sys.int::cas slot-value) (old new object slot-name)
   (cond ((std-class-p (class-of (class-of object)))
          (sys.int::cas (std-slot-value object slot-name) old new))
@@ -368,11 +396,9 @@
 (defun std-slot-makunbound (instance slot-name)
   (multiple-value-bind (slots location)
       (slot-location-in-instance instance slot-name)
-    (when (not location)
-      (return-from std-slot-makunbound
-        (values (slot-missing (class-of instance) instance
-                              slot-name 'slot-makunbound))))
-    (setf (standard-instance-access slots location) *secret-unbound-value*))
+    (if location
+        (setf (standard-instance-access slots location) *secret-unbound-value*)
+        (slot-missing (class-of instance) instance slot-name 'slot-makunbound)))
   instance)
 (defun slot-makunbound (object slot-name)
   (let ((metaclass (class-of (class-of object))))
@@ -380,9 +406,11 @@
            (std-slot-makunbound object slot-name))
           (t
            (let ((slot (find-effective-slot object slot-name)))
-             (if slot
-                 (slot-makunbound-using-class (class-of object) object slot)
-                 (values (slot-missing (class-of object) object slot-name 'slot-makunbound))))))))
+             (cond (slot
+                    (slot-makunbound-using-class (class-of object) object slot))
+                   (t
+                    (slot-missing (class-of object) object slot-name 'slot-makunbound)
+                    object)))))))
 
 (defun slot-exists-p (instance slot-name)
   (not (null (find-effective-slot instance slot-name))))
@@ -394,8 +422,7 @@
 ;;; class-of
 
 (defun class-of (x)
-  (cond ((or (sys.int::instance-p x)
-             (sys.int::funcallable-instance-p x))
+  (cond ((sys.int::instance-or-funcallable-instance-p x)
          (let ((layout (sys.int::%instance-layout x)))
            (cond ((sys.int::layout-p layout)
                   (sys.int::layout-class layout))
@@ -408,68 +435,139 @@
          (built-in-class-of x))))
 
 (defmacro find-class-cached (class)
-  `(let ((cache (load-time-value (cons nil nil))))
-     (let ((value (car cache)))
-       (when (not value)
-         (setf value (find-class ,class)
-               (car cache) value))
-       value)))
+  `(load-time-value (find-class ,class)))
 
 (defun built-in-class-of (x)
-  (typecase x
-    (null                                          (find-class-cached 'null))
-    (symbol                                        (find-class-cached 'symbol))
-    (fixnum                                        (find-class-cached 'fixnum))
-    (bignum                                        (find-class-cached 'bignum))
-    (single-float                                  (find-class-cached 'single-float))
-    (double-float                                  (find-class-cached 'double-float))
-    ((complex single-float)                        (find-class-cached 'sys.int::complex-single-float))
-    ((complex double-float)                        (find-class-cached 'sys.int::complex-double-float))
-    ((complex rational)                            (find-class-cached 'sys.int::complex-rational))
-    (ratio                                         (find-class-cached 'ratio))
-    (cons                                          (find-class-cached 'cons))
-    (character                                     (find-class-cached 'character))
-    (simple-string                                 (find-class-cached 'simple-string))
-    (string                                        (find-class-cached 'string))
-    (simple-bit-vector                             (find-class-cached 'simple-bit-vector))
-    (bit-vector                                    (find-class-cached 'bit-vector))
-    (simple-vector                                 (find-class-cached 'simple-vector))
-    ((simple-array fixnum (*))                     (find-class-cached 'sys.int::simple-array-fixnum))
-    ((simple-array (unsigned-byte 2) (*))          (find-class-cached 'sys.int::simple-array-unsigned-byte-2))
-    ((simple-array (unsigned-byte 4) (*))          (find-class-cached 'sys.int::simple-array-unsigned-byte-4))
-    ((simple-array (unsigned-byte 8) (*))          (find-class-cached 'sys.int::simple-array-unsigned-byte-8))
-    ((simple-array (unsigned-byte 16) (*))         (find-class-cached 'sys.int::simple-array-unsigned-byte-16))
-    ((simple-array (unsigned-byte 32) (*))         (find-class-cached 'sys.int::simple-array-unsigned-byte-32))
-    ((simple-array (unsigned-byte 64) (*))         (find-class-cached 'sys.int::simple-array-unsigned-byte-64))
-    ((simple-array (signed-byte 1) (*))            (find-class-cached 'sys.int::simple-array-signed-byte-1))
-    ((simple-array (signed-byte 2) (*))            (find-class-cached 'sys.int::simple-array-signed-byte-2))
-    ((simple-array (signed-byte 4) (*))            (find-class-cached 'sys.int::simple-array-signed-byte-4))
-    ((simple-array (signed-byte 8) (*))            (find-class-cached 'sys.int::simple-array-signed-byte-8))
-    ((simple-array (signed-byte 16) (*))           (find-class-cached 'sys.int::simple-array-signed-byte-16))
-    ((simple-array (signed-byte 32) (*))           (find-class-cached 'sys.int::simple-array-signed-byte-32))
-    ((simple-array (signed-byte 64) (*))           (find-class-cached 'sys.int::simple-array-signed-byte-64))
-    ((simple-array single-float (*))               (find-class-cached 'sys.int::simple-array-single-float))
-    ((simple-array double-float (*))               (find-class-cached 'sys.int::simple-array-double-float))
-    ((simple-array (complex single-float) (*))     (find-class-cached 'sys.int::simple-array-complex-single-float))
-    ((simple-array (complex double-float) (*))     (find-class-cached 'sys.int::simple-array-complex-double-float))
-    (vector                                        (find-class-cached 'vector))
-    (array                                         (find-class-cached 'array))
-    (mezzano.delimited-continuations:delimited-continuation
-     (find-class-cached 'mezzano.delimited-continuations:delimited-continuation))
-    (sys.int::closure                              (find-class-cached 'sys.int::closure))
-    (compiled-function                             (find-class-cached 'compiled-function))
-    (function                                      (find-class-cached 'function))
-    (sys.int::function-reference                   (find-class-cached 'sys.int::function-reference))
-    (sys.int::weak-pointer                         (find-class-cached 'sys.int::weak-pointer))
-    ;; FIXME: Should return LARGE-BYTE for large bytes.
-    ;; LARGE-BYTE needs to be a subclass of BYTE.
-    (byte                                          (find-class-cached 'byte))
-    (mezzano.simd:mmx-vector                       (find-class-cached 'mezzano.simd:mmx-vector))
-    (mezzano.simd:sse-vector                       (find-class-cached 'mezzano.simd:sse-vector))
-    (mezzano.runtime::symbol-value-cell            (find-class-cached 'mezzano.runtime::symbol-value-cell))
-    ;; TODO: Replace this with an error. Every object in the system should
-    ;; have a sensible class.
-    (t                                             (find-class-cached 't))))
+  (cond
+    ((null x)                       (find-class-cached 'null))
+    ((sys.int::%value-has-tag-p x sys.int::+tag-object+)
+     (let ((class (svref (load-time-value
+                          (let ((vec (make-array (expt 2 sys.int::+object-type-size+)
+                                                 :initial-element nil)))
+                            (setf (aref vec sys.int::+object-tag-array-t+)
+                                  (find-class 'simple-vector))
+                            (setf (aref vec sys.int::+object-tag-array-fixnum+)
+                                  (find-class 'sys.int::simple-array-fixnum))
+                            (setf (aref vec sys.int::+object-tag-array-bit+)
+                                  (find-class 'simple-bit-vector))
+                            (setf (aref vec sys.int::+object-tag-array-unsigned-byte-2+)
+                                  (find-class 'sys.int::simple-array-unsigned-byte-2))
+                            (setf (aref vec sys.int::+object-tag-array-unsigned-byte-4+)
+                                  (find-class 'sys.int::simple-array-unsigned-byte-4))
+                            (setf (aref vec sys.int::+object-tag-array-unsigned-byte-8+)
+                                  (find-class 'sys.int::simple-array-unsigned-byte-8))
+                            (setf (aref vec sys.int::+object-tag-array-unsigned-byte-16+)
+                                  (find-class 'sys.int::simple-array-unsigned-byte-16))
+                            (setf (aref vec sys.int::+object-tag-array-unsigned-byte-32+)
+                                  (find-class 'sys.int::simple-array-unsigned-byte-32))
+                            (setf (aref vec sys.int::+object-tag-array-unsigned-byte-64+)
+                                  (find-class 'sys.int::simple-array-unsigned-byte-64))
+                            (setf (aref vec sys.int::+object-tag-array-signed-byte-1+)
+                                  (find-class 'sys.int::simple-array-signed-byte-1))
+                            (setf (aref vec sys.int::+object-tag-array-signed-byte-2+)
+                                  (find-class 'sys.int::simple-array-signed-byte-2))
+                            (setf (aref vec sys.int::+object-tag-array-signed-byte-4+)
+                                  (find-class 'sys.int::simple-array-signed-byte-4))
+                            (setf (aref vec sys.int::+object-tag-array-signed-byte-8+)
+                                  (find-class 'sys.int::simple-array-signed-byte-8))
+                            (setf (aref vec sys.int::+object-tag-array-signed-byte-16+)
+                                  (find-class 'sys.int::simple-array-signed-byte-16))
+                            (setf (aref vec sys.int::+object-tag-array-signed-byte-32+)
+                                  (find-class 'sys.int::simple-array-signed-byte-32))
+                            (setf (aref vec sys.int::+object-tag-array-signed-byte-64+)
+                                  (find-class 'sys.int::simple-array-signed-byte-64))
+                            (setf (aref vec sys.int::+object-tag-array-single-float+)
+                                  (find-class 'sys.int::simple-array-single-float))
+                            (setf (aref vec sys.int::+object-tag-array-double-float+)
+                                  (find-class 'sys.int::simple-array-double-float))
+                            #+(or)
+                            (setf (aref vec sys.int::+object-tag-array-short-float+)
+                                  (find-class 'sys.int::simple-array-short-float))
+                            #+(or)
+                            (setf (aref vec sys.int::+object-tag-array-long-float+)
+                                  (find-class 'sys.int::simple-array-long-float))
+                            (setf (aref vec sys.int::+object-tag-array-complex-single-float+)
+                                  (find-class 'sys.int::simple-array-complex-single-float))
+                            (setf (aref vec sys.int::+object-tag-array-complex-double-float+)
+                                  (find-class 'sys.int::simple-array-complex-double-float))
+                            #+(or)
+                            (setf (aref vec sys.int::+object-tag-array-complex-short-float+)
+                                  (find-class 'sys.int::simple-array-complex-short-float))
+                            #+(or)
+                            (setf (aref vec sys.int::+object-tag-array-complex-long-float+)
+                                  (find-class 'sys.int::simple-array-complex-long-float))
+                            (setf (aref vec sys.int::+object-tag-bignum+)
+                                  (find-class 'bignum))
+                            (setf (aref vec sys.int::+object-tag-ratio+)
+                                  (find-class 'ratio))
+                            (setf (aref vec sys.int::+object-tag-double-float+)
+                                  (find-class 'double-float))
+                            #+(or)
+                            (setf (aref vec sys.int::+object-tag-short-float+)
+                                  (find-class 'short-float))
+                            #+(or)
+                            (setf (aref vec sys.int::+object-tag-long-float+)
+                                  (find-class 'long-float))
+                            (setf (aref vec sys.int::+object-tag-complex-rational+)
+                                  (find-class 'sys.int::complex-rational))
+                            (setf (aref vec sys.int::+object-tag-complex-single-float+)
+                                  (find-class 'sys.int::complex-single-float))
+                            (setf (aref vec sys.int::+object-tag-complex-double-float+)
+                                  (find-class 'sys.int::complex-double-float))
+                            #+(or)
+                            (setf (aref vec sys.int::+object-tag-complex-short-float+)
+                                  (find-class 'sys.int::complex-short-float))
+                            #+(or)
+                            (setf (aref vec sys.int::+object-tag-complex-long-float+)
+                                  (find-class 'sys.int::complex-long-float))
+                            (setf (aref vec sys.int::+object-tag-symbol-value-cell+)
+                                  (find-class 'mezzano.runtime::symbol-value-cell))
+                            (setf (aref vec sys.int::+object-tag-mmx-vector+)
+                                  (find-class 'mezzano.simd:mmx-vector))
+                            ;; NIL is taken care of above.
+                            (setf (aref vec sys.int::+object-tag-symbol+)
+                                  (find-class 'symbol))
+                            (setf (aref vec sys.int::+object-tag-sse-vector+)
+                                  (find-class 'mezzano.simd:sse-vector))
+                            (setf (aref vec sys.int::+object-tag-weak-pointer-vector+)
+                                  (find-class 'sys.int::weak-pointer-vector))
+                            (setf (aref vec sys.int::+object-tag-function-reference+)
+                                  (find-class 'sys.int::function-reference))
+                            (setf (aref vec sys.int::+object-tag-interrupt-frame+)
+                                  (find-class 'sys.int::interrupt-frame))
+                            (setf (aref vec sys.int::+object-tag-weak-pointer+)
+                                  (find-class 'sys.int::weak-pointer))
+                            (setf (aref vec sys.int::+object-tag-delimited-continuation+)
+                                  (find-class 'mezzano.delimited-continuations:delimited-continuation))
+                            (setf (aref vec sys.int::+object-tag-function+)
+                                  (find-class 'compiled-function))
+                            (setf (aref vec sys.int::+object-tag-closure+)
+                                  (find-class 'sys.int::closure))
+                            vec))
+                         (sys.int::%object-tag x))))
+       (cond (class)
+             ((simple-string-p x)
+              (find-class-cached 'simple-string))
+             ((stringp x)
+              (find-class-cached 'string))
+             ((sys.int::simple-array-p x)
+              (find-class-cached 'simple-array))
+             ((bit-vector-p x)
+              (find-class-cached 'bit-vector))
+             ((vectorp x)
+              (find-class-cached 'vector))
+             ((arrayp x)
+              (find-class-cached 'array))
+             (t
+              (error "Internal error, no class for value ~S" x)))))
+    ((sys.int::fixnump x)           (find-class-cached 'fixnum))
+    ((consp x)                      (find-class-cached 'cons))
+    ((characterp x)                 (find-class-cached 'character))
+    ((sys.int::single-float-p x)    (find-class-cached 'single-float))
+    ((sys.int::small-byte-p x)      (find-class-cached 'byte))
+    ((sys.int::instance-header-p x) (find-class-cached 'sys.int::instance-header))
+    (t
+     (error "Internal error, no class for value ~S" x))))
 
 ;;; subclassp and sub-specializer-p
 
@@ -583,8 +681,9 @@
 (defun safe-class-precedence-list (class)
   (cond ((standard-class-instance-p class)
          (standard-instance-access class *standard-class-precedence-list-location*))
-        ((or (funcallable-standard-class-instance-p class)
-             (built-in-class-instance-p class))
+        ((built-in-class-instance-p class)
+         (standard-instance-access class *built-in-class-precedence-list-location*))
+        ((funcallable-standard-class-instance-p class)
          (std-slot-value class 'precedence-list))
         (t
          (class-precedence-list class))))
@@ -648,7 +747,14 @@ Other arguments are included directly."
                      &key
                        &allow-other-keys)
   (apply #'ensure-class-using-class
-         (find-class name nil)
+         ;; Ignore any existing class if the proper name does not
+         ;; match the supplied name.
+         ;; SBCL does this check here in ENSURE-CLASS, CLISP does it
+         ;; in ENSURE-CLASS-USING-CLASS. Both options seem valid.
+         (let ((class (find-class name nil)))
+           (if (and class (eql name (class-name class)))
+               class
+               nil))
          name
          all-keys))
 
@@ -826,6 +932,12 @@ Other arguments are included directly."
 (defun (setf safe-slot-definition-type) (value slot-definition)
   (setf (std-slot-value slot-definition 'type) value))
 
+(defun safe-slot-definition-typecheck (effective-slot-definition)
+  (declare (notinline slot-value)) ; Bootstrap hack
+  (if (standard-effective-slot-definition-instance-p effective-slot-definition)
+      (std-slot-value effective-slot-definition 'typecheck)
+      (slot-definition-typecheck effective-slot-definition)))
+
 (defun safe-slot-definition-readers (direct-slot-definition)
   (if (standard-direct-slot-definition-instance-p direct-slot-definition)
       (std-slot-value direct-slot-definition 'readers)
@@ -870,6 +982,23 @@ Other arguments are included directly."
        (equalp (sys.int::layout-instance-slots layout-a)
                (sys.int::layout-instance-slots layout-b))))
 
+(defun compute-class-heap-size (class instance-slots)
+  (declare (notinline typep)) ; bootstrap hack.
+  (cond ((and (endp instance-slots)
+              (typep class 'funcallable-standard-class))
+         ;; Funcallable instances must always be at least
+         ;; 2 words long, for the implicit leading entry
+         ;; point and function slots.
+         2)
+        (t
+         (loop
+            ;; Using the effective slot locations
+            ;; accounts for the FC instance offset.
+            for slot in instance-slots
+            for location = (mezzano.runtime::location-offset-t
+                            (safe-slot-definition-location slot))
+            maximize (1+ location)))))
+
 (defun std-finalize-inheritance (class)
   (dolist (super (safe-class-direct-superclasses class))
     (ensure-class-finalized super)
@@ -887,13 +1016,7 @@ Other arguments are included directly."
          (layout (sys.int::make-layout
                   :class class
                   :obsolete nil
-                  :heap-size (loop
-                                ;; Using the effective slot locations
-                                ;; accounts for the FC instance offset.
-                                for slot in instance-slots
-                                for location = (mezzano.runtime::location-offset-t
-                                                (safe-slot-definition-location slot))
-                                maximize (1+ location))
+                  :heap-size (compute-class-heap-size class instance-slots)
                   :heap-layout t
                   :area (std-slot-value class 'allocation-area)
                   :instance-slots instance-slot-vector)))
@@ -902,8 +1025,13 @@ Other arguments are included directly."
        for slot in instance-slots
        for slot-name = (safe-slot-definition-name slot)
        for location = (safe-slot-definition-location slot)
-       do (setf (aref instance-slot-vector i) slot-name
-                (aref instance-slot-vector (1+ i)) location))
+       do
+       ;; (funcallable-)standard-instance-access requires that all slots
+       ;; be of type T, as does the above heap layout.
+         (assert (eql (mezzano.runtime::location-type location)
+                      mezzano.runtime::+location-type-t+))
+         (setf (aref instance-slot-vector i) slot-name
+               (aref instance-slot-vector (1+ i)) location))
     ;; TODO: Should call MAKE-INSTANCES-OBSOLETE here and have that rebuild
     ;; the layout.
     (let ((prev-layout (safe-class-slot-storage-layout class)))
@@ -1030,9 +1158,75 @@ Other arguments are included directly."
          (apply #'effective-slot-definition-class class initargs)
          initargs))
 
+(defun combine-direct-slot-types (direct-slots)
+  (let* ((types (remove-duplicates (remove 't (mapcar #'safe-slot-definition-type direct-slots))
+                                   :test #'sys.int::type-equal)))
+    (cond ((endp types)
+           't)
+          ((endp (rest types))
+           (first types))
+          (t
+           `(and ,@types)))))
+
+(defun compute-typecheck-function (type-specifier)
+  (when (eql type-specifier 't)
+    ;; No type check function required.
+    (return-from compute-typecheck-function nil))
+  (let* ((type-symbol (cond ((symbolp type-specifier)
+                             type-specifier)
+                            ((and (consp type-specifier)
+                                  (null (rest type-specifier)))
+                             (first type-specifier))))
+         (type-fn (and type-symbol
+                       (let ((info (sys.int::type-info-for type-symbol nil)))
+                         (and info (sys.int::type-info-type-symbol info))))))
+    (macrolet ((specific-type (type)
+                 `(and (sys.int::type-equal type-specifier ',type)
+                       (lambda (object)
+                         (declare (sys.int::lambda-name (typecheck ,type)))
+                         (typep object ',type))))
+               (known-type (type function)
+                 `(and (sys.int::type-equal type-specifier ',type)
+                       #',function)))
+      (cond (type-fn)
+            ;; Pick off some common and known types to avoid
+            ;; going through the compiler.
+            ;; These were picked by looking through all slot type declarations
+            ;; and picking the most common/generic looking ones.
+            ;; These are also the types required for bootstrapping, avoiding
+            ;; a call into the compiler before the compiler has been loaded.
+            ((specific-type (unsigned-byte 8)))
+            ((specific-type (unsigned-byte 16)))
+            ((specific-type (unsigned-byte 32)))
+            ((specific-type (unsigned-byte 64)))
+            ((specific-type (signed-byte 8)))
+            ((specific-type (signed-byte 16)))
+            ((specific-type (signed-byte 32)))
+            ((specific-type (signed-byte 64)))
+            ((known-type integer integerp))
+            ((specific-type (integer 0)))
+            ((known-type fixnum sys.int::fixnump))
+            ((specific-type (and fixnum (integer 0))))
+            ((specific-type boolean))
+            ((known-type simple-vector simple-vector-p))
+            ((known-type string stringp))
+            ;; Bootstrap types
+            ((specific-type (or null (integer 1)))) ; mailbox
+            ((specific-type (or null (integer 0)))) ; semaphore
+            ((specific-type (member :lf-ignore-cr :cr :lf :crlf :lfcr))) ; external-format
+            (t
+             (multiple-value-bind (expansion expanded-p)
+                 (sys.int::typeexpand-1 type-specifier)
+               (if expanded-p
+                   (compute-typecheck-function expansion)
+                   (compile nil `(lambda (object)
+                                   (declare (sys.int::lambda-name (typecheck ,type-specifier)))
+                                   (typep object ',type-specifier))))))))))
+
 (defun std-compute-effective-slot-definition (class name direct-slots)
   (let ((initer (find-if-not #'null direct-slots
-                             :key #'safe-slot-definition-initfunction)))
+                             :key #'safe-slot-definition-initfunction))
+        (type (combine-direct-slot-types direct-slots)))
     (make-effective-slot-definition
      class
      :name name
@@ -1045,7 +1239,13 @@ Other arguments are included directly."
      :initargs (remove-duplicates
                 (mapappend #'safe-slot-definition-initargs
                            direct-slots))
-     :allocation (safe-slot-definition-allocation (car direct-slots)))))
+     :allocation (safe-slot-definition-allocation (car direct-slots))
+     :documentation (loop
+                       for slot in direct-slots
+                       when (safe-slot-definition-allocation slot)
+                       do (return (safe-slot-definition-allocation slot)))
+     :type type
+     :typecheck (compute-typecheck-function type))))
 
 ;;;
 ;;; Generic function metaobjects and standard-generic-function
@@ -1171,7 +1371,7 @@ Other arguments are included directly."
 (defun ensure-generic-function
        (function-name
         &rest all-keys
-        &key (generic-function-class *the-class-standard-gf*)
+        &key generic-function-class
              (method-class 'standard-method)
         &allow-other-keys)
   (cond ((and (symbolp function-name)
@@ -1193,18 +1393,44 @@ Other arguments are included directly."
          (when (fboundp function-name)
            (fmakunbound function-name))
          (setf (compiler-macro-function function-name) nil)))
+  (when (and generic-function-class
+             (symbolp generic-function-class))
+    (setf generic-function-class (find-class generic-function-class)))
+  ;; AMOP seems to imply that METHOD-CLASS should always be a class name,
+  ;; that feels overly restrictive...
+  (when (symbolp method-class)
+    (setf method-class (find-class method-class)))
+  ;; :GENERIC-FUNCTION-CLASS is not included as an initarg.
+  (remf all-keys :generic-function-class)
+  ;; FIXME: What to do with this?
+  (remf all-keys :environment)
   (cond ((fboundp function-name)
-         ;; This should call reinitialize-instance here, but whatever.
-         (fdefinition function-name))
+         (let ((gf (fdefinition function-name)))
+           (when (and generic-function-class
+                      (not (eql (class-of gf) generic-function-class)))
+             (error "Redefinition of generic function ~S (~S) with different class. Changing from ~S to ~S."
+                    function-name gf
+                    (class-of gf) generic-function-class))
+           ;; Bootstrap hack: Avoid calling REINITIALIZE-INSTANCE when
+           ;; no keys are passed in. (ENSURE-GENERIC-FUNCTION name) is
+           ;; called by DEFMETHOD-1 to fetch the generic function and
+           ;; this happens before REINITIALIZE-INSTANCE is defined.
+           (when all-keys
+             (apply #'reinitialize-instance
+                    gf
+                    :name function-name
+                    :method-class method-class
+                    all-keys))
+           gf))
         (t
-         ;; :GENERIC-FUNCTION-CLASS is not included as an initarg.
-         (remf all-keys :generic-function-class)
+         (when (not generic-function-class)
+           (setf generic-function-class *the-class-standard-gf*))
          (let ((gf (apply (if (eq generic-function-class *the-class-standard-gf*)
                               #'make-instance-standard-generic-function
                               #'make-instance)
                           generic-function-class
                           :name function-name
-                          :method-class (find-class method-class)
+                          :method-class method-class
                           all-keys)))
            ;; Not entirely sure where this should be done.
            ;; SBCL seems to do it in (ENSURE-GENERIC-FUNCTION-USING-CLASS NULL).
@@ -1289,9 +1515,12 @@ has only has class specializer."
     (when (endp argument-precedence)
       (setf argument-precedence (copy-list required-args)
             (safe-generic-function-argument-precedence-order gf) argument-precedence))
-    (assert (eql (length required-args) (length argument-precedence)))
-    (assert (endp (set-difference required-args argument-precedence)))
-    (assert (endp (set-difference argument-precedence required-args)))
+    (when (or (not (eql (length required-args) (length argument-precedence)))
+              (set-difference required-args argument-precedence)
+              (set-difference argument-precedence required-args))
+      (error 'sys.int::simple-program-error
+             :format-control "Argument precedence list ~:S does not match required arguments ~:S"
+             :format-arguments (list argument-precedence required-args)))
     (cond ((every #'eql required-args argument-precedence)
            ;; No argument reordering required.
            (setf (argument-reordering-table gf) nil))
@@ -1338,35 +1567,24 @@ has only has class specializer."
 ;;; instance of standard-generic-function without falling into method lookup.
 ;;; However, it cannot be called until standard-generic-function exists.
 
-(defun initialize-instance-standard-generic-function (gf &rest initargs &key
-                                                                          name
-                                                                          lambda-list
-                                                                          method-class
-                                                                          documentation
-                                                                          method-combination
-                                                                          argument-precedence-order
-                                                                          declarations)
+(defun initialize-instance-standard-generic-function (gf &key
+                                                           name
+                                                           lambda-list
+                                                           method-class
+                                                           documentation
+                                                           method-combination
+                                                           argument-precedence-order
+                                                           declarations)
   (setf (safe-generic-function-name gf) name)
   (setf (safe-generic-function-lambda-list gf) lambda-list)
   (setf (safe-generic-function-methods gf) ())
   (setf (safe-generic-function-method-combination gf) method-combination)
   (setf (safe-generic-function-declarations gf) declarations)
+  (setf (std-slot-value gf 'documentation) documentation)
   (setf (std-slot-value gf 'dependents) '())
   (setf (classes-to-emf-table gf) nil)
   (setf (safe-generic-function-argument-precedence-order gf) argument-precedence-order)
-  (apply #'initialize-instance-after-standard-generic-function gf initargs))
-
-(defun initialize-instance-after-standard-generic-function (gf &key
-                                                                 name
-                                                                 lambda-list
-                                                                 method-class
-                                                                 documentation
-                                                                 method-combination
-                                                                 argument-precedence-order
-                                                                 declarations)
-  (setf (safe-generic-function-method-class gf) (if (typep method-class 'class)
-                                                    method-class
-                                                    (find-class method-class)))
+  (setf (safe-generic-function-method-class gf) method-class)
   (finalize-generic-function gf))
 
 (defun make-instance-standard-generic-function
@@ -1407,8 +1625,12 @@ has only has class specializer."
 ;;; be called until standard-method exists.
 
 (defun make-instance-standard-method (method-class
-                                      &key lambda-list qualifiers
-                                           specializers function)
+                                      &key
+                                        lambda-list
+                                        qualifiers
+                                        specializers
+                                        function
+                                        documentation)
   (declare (ignore method-class))
   (let ((method (std-allocate-instance *the-class-standard-method*)))
     (setf (safe-method-lambda-list method) lambda-list)
@@ -1416,6 +1638,7 @@ has only has class specializer."
     (setf (safe-method-specializers method) specializers)
     (setf (safe-method-generic-function method) nil)
     (setf (safe-method-function method) function)
+    (setf (std-slot-value method 'documentation) documentation)
     method))
 
 (defun check-method-lambda-list-congruence (gf method)
@@ -1441,8 +1664,17 @@ has only has class specializer."
                   (and (not gf-accepts-key-or-rest)
                        (not method-accepts-key-or-rest)))
               (gf method)
-            "Generic function ~S and method ~S differ in their acceptance of &KEY or &REST arguments."
-            gf method))))
+              "Generic function ~S and method ~S differ in their acceptance of &KEY or &REST arguments."
+              gf method))
+    ;; If a method accepts keywords, then it must accept all the keywords that the generic function accepts
+    (when (and (member '&key (safe-method-lambda-list method))
+               (not (member '&allow-other-keys (safe-method-lambda-list method))))
+      (let ((missing-keywords (set-difference (getf gf-ll :keywords)
+                                              (getf method-ll :keywords))))
+        (assert (endp missing-keywords)
+                (gf method)
+                "Method ~S must accept all keywords accepted by generic function ~S. It is missing ~:S"
+                method gf missing-keywords)))))
 
 ;;; add-method
 
@@ -1626,13 +1858,25 @@ has only has class specializer."
           (fast-slot-read object location slot-definition)
           (slow-single-dispatch-method-lookup* gf argument-offset (list object) :reader)))))
 
+(defstruct (writer-discriminator-entry
+             :sealed)
+  location
+  typecheck
+  type)
+
 (defun compute-writer-discriminator (gf emf-table argument-offset slot-definition)
   (lambda (new-value object)
     (let* ((class (class-of object))
            (location (single-dispatch-emf-entry emf-table class)))
-      (if location
-          (fast-slot-write new-value object location slot-definition)
-          (slow-single-dispatch-method-lookup* gf argument-offset (list new-value object) :writer)))))
+      (cond (location
+             (let ((typecheck (writer-discriminator-entry-typecheck location)))
+               (when (and typecheck (not (funcall typecheck new-value)))
+                 (error 'type-error
+                        :datum new-value
+                        :expected-type (writer-discriminator-entry-type location))))
+             (fast-slot-write new-value object (writer-discriminator-entry-location location) slot-definition))
+            (t
+             (slow-single-dispatch-method-lookup* gf argument-offset (list new-value object) :writer))))))
 
 (defun compute-1-effective-discriminator (gf emf-table argument-offset)
   (let ((eql-table (compute-1-effective-eql-table gf argument-offset)))
@@ -1767,14 +2011,25 @@ has only has class specializer."
                 (let* ((instance (second args))
                        (slot-def (accessor-method-slot-definition (first applicable-methods)))
                        (slot-name (slot-definition-name slot-def))
-                       (effective-slot (find-effective-slot instance slot-name)))
+                       (effective-slot (find-effective-slot instance slot-name))
+                       (new-value (first args)))
                   (cond (effective-slot
-                         (let ((location (safe-slot-definition-location effective-slot)))
-                           (setf (single-dispatch-emf-entry emf-table class) location)
-                           (fast-slot-write (first args) instance location slot-def)))
+                         (let* ((location (safe-slot-definition-location effective-slot))
+                                (typecheck (safe-slot-definition-typecheck effective-slot))
+                                (type (safe-slot-definition-type effective-slot))
+                                (entry (make-writer-discriminator-entry
+                                        :location location
+                                        :typecheck typecheck
+                                        :type type)))
+                           (setf (single-dispatch-emf-entry emf-table class) entry)
+                           (when (and typecheck (not (funcall typecheck new-value)))
+                             (error 'type-error
+                                    :datum new-value
+                                    :expected-type type))
+                           (fast-slot-write new-value instance location slot-def)))
                         (t
                          ;; Slot not present, fall back on SLOT-VALUE.
-                         (setf (slot-value instance slot-name) (first args))))))
+                         (setf (slot-value instance slot-name) new-value)))))
                (t ;; Give up and use the full path.
                 (slow-single-dispatch-method-lookup* gf argument-offset args :never-called)))))
       (:never-called
@@ -2065,7 +2320,6 @@ has only has class specializer."
   (multiple-value-bind (keywords suppress-keyword-checking)
       (applicable-methods-keywords gf methods)
     (let* ((method-args (gensym "ARGS"))
-           (next-emfun (gensym "NEXT-EMFUN"))
            (gf-lambda-list-info (analyze-lambda-list (safe-generic-function-lambda-list gf)))
            (key-arg-index (+ (length (getf gf-lambda-list-info :required-names))
                              (length (getf gf-lambda-list-info :optional-args)))))
@@ -2159,7 +2413,6 @@ has only has class specializer."
     ;; the generic function is not a standard-generic-function and mc is the standard method combination.
     (cond (mc
            (let* ((mc-object (method-combination-object-method-combination mc))
-                  (mc-args (method-combination-object-arguments mc))
                   (effective-method-body (compute-effective-method gf mc methods))
                   (name (generate-method-combination-effective-method-name gf mc-object methods)))
              (eval (generate-method-combination-effective-method name effective-method-body gf methods))))
@@ -2249,7 +2502,17 @@ has only has class specializer."
     (declare (notinline slot-boundp slot-value (setf slot-value))) ; bootstrap hack
     (when (not (slot-boundp class 'prototype))
       (setf (slot-value class 'prototype) (allocate-instance class)))
-    (slot-value class 'prototype)))
+    (slot-value class 'prototype))
+  (:method ((class built-in-class))
+    ;; FIXME: This is a bit weird.
+    ;; Cook up a layout & instance for this class.
+    (sys.int::%allocate-instance
+     (sys.int::make-layout :class class
+                           :obsolete nil
+                           :heap-size 0
+                           :heap-layout t
+                           :area nil
+                           :instance-slots #()))))
 (defgeneric class-sealed (class)
   (:method ((class clos-class))
     (declare (notinline slot-value)) ; bootstrap hack
@@ -2289,6 +2552,10 @@ has only has class specializer."
   (:method ((slot-definition standard-slot-definition))
     (declare (notinline slot-value)) ; bootstrap hack
     (slot-value slot-definition 'type)))
+(defgeneric slot-definition-typecheck (effective-slot-definition)
+  (:method ((slot-definition standard-effective-slot-definition))
+    (declare (notinline slot-value)) ; bootstrap hack
+    (slot-value slot-definition 'typecheck)))
 (defgeneric slot-definition-readers (direct-slot-definition)
   (:method ((direct-slot-definition standard-direct-slot-definition))
     (declare (notinline slot-value)) ; bootstrap hack
@@ -2301,6 +2568,10 @@ has only has class specializer."
   (:method ((effective-slot-definition standard-effective-slot-definition))
     (declare (notinline slot-value)) ; bootstrap hack
     (slot-value effective-slot-definition 'location)))
+(defgeneric slot-definition-documentation (slot-definition)
+  (:method ((slot-definition standard-slot-definition))
+    (declare (notinline slot-value)) ; bootstrap hack
+    (slot-value slot-definition 'documentation)))
 
 ;;; Generic function metaobject readers
 
@@ -2446,10 +2717,12 @@ has only has class specializer."
 
 (defgeneric direct-slot-definition-class (class &rest initargs))
 (defmethod direct-slot-definition-class ((class std-class) &rest initargs)
+  (declare (ignore initargs))
   *the-class-standard-direct-slot-definition*)
 
 (defgeneric effective-slot-definition-class (class &rest initargs))
 (defmethod effective-slot-definition-class ((class std-class) &rest initargs)
+  (declare (ignore initargs))
   *the-class-standard-effective-slot-definition*)
 
 (defgeneric function-keywords (method))
@@ -2506,9 +2779,6 @@ has only has class specializer."
 
 (defgeneric compute-default-initargs (class))
 (defmethod compute-default-initargs ((class std-class))
-  (std-compute-default-initargs class))
-
-(defun std-compute-default-initargs (class)
   (let ((default-initargs '()))
     (dolist (c (safe-class-precedence-list class))
       (loop
@@ -2617,8 +2887,9 @@ has only has class specializer."
          (list 'shared-initialize (class-prototype class) t))
    initargs
    (lambda (valid-initargs invalid-initargs)
-     (error "Invalid initargs ~:S when creating instance of ~S (~S).~%Supplied: ~:S~%valid:~:S"
-            invalid-initargs class (class-name class) initargs valid-initargs))))
+     (error 'sys.int::simple-program-error
+            :format-control "Invalid initargs ~:S when creating instance of ~S (~S).~%Supplied: ~:S~%valid: ~:S"
+            :format-arguments (list invalid-initargs class (class-name class) initargs valid-initargs)))))
 
 (defgeneric make-instance (class &rest initargs &key &allow-other-keys))
 (defmethod make-instance ((class std-class) &rest initargs)
@@ -2655,8 +2926,9 @@ has only has class specializer."
          (list 'shared-initialize object t))
    initargs
    (lambda (valid-initargs invalid-initargs)
-     (error "Invalid initargs ~S when reinitializing ~S (~S).~%Supplied: ~:S~%valid:~:S"
-            invalid-initargs object (class-name (class-of object)) initargs valid-initargs))))
+     (error 'sys.int::simple-program-error
+            :format-control "Invalid initargs ~S when reinitializing ~S (~S).~%Supplied: ~:S~%valid: ~:S"
+            :format-arguments (list invalid-initargs object (class-name (class-of object)) initargs valid-initargs)))))
 
 (defgeneric reinitialize-instance (instance &key &allow-other-keys))
 (defmethod reinitialize-instance ((instance standard-object) &rest initargs)
@@ -2699,12 +2971,13 @@ has only has class specializer."
           (setf (slot-value old-copy slot-name)
                 (slot-value old-instance slot-name)))))
     ;; Initialize the new instance with the old slots.
-    (dolist (slot-name (mapcar #'safe-slot-definition-name
-                               (safe-class-slots new-class)))
-      (when (and (slot-exists-p old-instance slot-name)
-                 (slot-boundp old-instance slot-name))
-        (setf (slot-value new-instance slot-name)
-              (slot-value old-instance slot-name))))
+    (dolist (new-slot (safe-class-slots new-class))
+      (when (instance-slot-p new-slot)
+        (let ((slot-name (safe-slot-definition-name new-slot)))
+          (when (and (slot-exists-p old-instance slot-name)
+                     (slot-boundp old-instance slot-name))
+            (setf (slot-value new-instance slot-name)
+                  (slot-value old-instance slot-name))))))
     ;; Obsolete the old instance, replacing it with the new instance.
     (mezzano.runtime::supersede-instance old-instance new-instance)
     (apply #'update-instance-for-different-class
@@ -2724,8 +2997,9 @@ has only has class specializer."
          (list 'shared-initialize new t))
    initargs
    (lambda (valid-initargs invalid-initargs)
-     (error "Invalid initargs ~:S when updating ~S (~S) for different class.~%Supplied: ~:S~%valid:~:S"
-            invalid-initargs new (class-name (class-of new)) initargs valid-initargs))))
+     (error 'sys.int::simple-program-error
+            :format-control "Invalid initargs ~:S when updating ~S (~S) for different class.~%Supplied: ~:S~%valid: ~:S"
+            :format-initargs (list invalid-initargs new (class-name (class-of new)) initargs valid-initargs)))))
 
 (defgeneric update-instance-for-different-class (old new &key &allow-other-keys))
 (defmethod update-instance-for-different-class ((old standard-object)
@@ -2754,16 +3028,22 @@ has only has class specializer."
   (print-unreadable-object (slot-definition stream :type t :identity t)
     (format stream "~S" (safe-slot-definition-name slot-definition))))
 
+(defmethod print-object ((slot-definition structure-slot-definition) stream)
+  (print-unreadable-object (slot-definition stream :type t :identity t)
+    (format stream "~S" (safe-slot-definition-name slot-definition))))
+
 (defmethod initialize-instance :after ((class std-class) &rest args &key direct-superclasses direct-slots direct-default-initargs documentation area sealed)
-  (declare (ignore direct-superclasses direct-slots direcet-default-initargs documentation))
+  (declare (ignore direct-superclasses direct-slots direct-default-initargs documentation area sealed))
   (apply #'std-after-initialization-for-classes class args))
 
 (defgeneric reader-method-class (class direct-slot &rest initargs))
 (defmethod reader-method-class ((class std-class) (direct-slot standard-direct-slot-definition) &rest initargs)
+  (declare (ignore initargs))
   (find-class 'standard-reader-method))
 
 (defgeneric writer-method-class (class direct-slot &rest initargs))
 (defmethod writer-method-class ((class std-class) (direct-slot standard-direct-slot-definition) &rest initargs)
+  (declare (ignore initargs))
   (find-class 'standard-writer-method))
 
 ;;; Finalize inheritance
@@ -2810,10 +3090,52 @@ has only has class specializer."
                  (method-combination-object-method-combination mc))))))
   gf)
 
-(defmethod initialize-instance :after ((gf standard-generic-function) &rest initargs &key method-class)
-  (apply #'initialize-instance-after-standard-generic-function gf initargs))
+(defmethod initialize-instance :after ((generic-function standard-generic-function) &key)
+  (finalize-generic-function generic-function))
 
-(defmethod reinitialize-instance :after ((generic-function standard-generic-function) &rest initargs &key)
+(defmethod reinitialize-instance :before ((generic-function standard-generic-function) &key (lambda-list nil lambda-list-p))
+  (when lambda-list-p
+    (let ((gf-ll (analyze-lambda-list lambda-list)))
+      (dolist (method (generic-function-methods generic-function))
+        ;; Make sure that the new lambda-list is congruent with existing methods.
+        (let ((method-ll (analyze-lambda-list (safe-method-lambda-list method))))
+          (assert (eql (length (getf gf-ll :required-args))
+                       (length (getf method-ll :required-args)))
+                  (generic-function method)
+                  "New lambda-list ~:S for generic function ~S and method ~S have differing required arguments."
+                  lambda-list generic-function method)
+          (assert (eql (length (getf gf-ll :optional-args))
+                       (length (getf method-ll :optional-args)))
+                  (generic-function method)
+                  "New lambda-list ~:S for generic function ~S and method ~S have differing optional arguments."
+                  lambda-list generic-function method)
+          (let ((gf-accepts-key-or-rest (or (getf gf-ll :rest-var)
+                                            (member '&key lambda-list)))
+                (method-accepts-key-or-rest (or (getf method-ll :rest-var)
+                                                (member '&key (safe-method-lambda-list method)))))
+            (assert (or (and gf-accepts-key-or-rest
+                             method-accepts-key-or-rest)
+                        (and (not gf-accepts-key-or-rest)
+                             (not method-accepts-key-or-rest)))
+                    (generic-function method)
+                    "New lambda-list ~:S for generic function ~S and method ~S differ in their acceptance of &KEY or &REST arguments."
+                    lambda-list generic-function method))
+          ;; If a method accepts keywords, then it must accept all the keywords that the generic function accepts
+          (when (and (member '&key (safe-method-lambda-list method))
+                     (not (member '&allow-other-keys (safe-method-lambda-list method))))
+            (let ((missing-keywords (set-difference (getf gf-ll :keywords)
+                                                    (getf method-ll :keywords))))
+              (assert (endp missing-keywords)
+                      (generic-function method)
+                      "Method ~S must accept all keywords accepted by new lambda-list ~:S for generic function ~S. It is missing ~:S"
+                      method lambda-list generic-function missing-keywords))))))))
+
+(defmethod reinitialize-instance :after ((generic-function standard-generic-function) &rest initargs &key argument-precedence-order lambda-list)
+  (when (and lambda-list (not argument-precedence-order))
+    ;; If :LAMBDA-LIST is supplied and :ARGUMENT-PRECEDENCE-ORDER is not, then
+    ;; ARGUMENT-PRECEDENCE-ORDER defaults to the required portion of LAMBDA-LIST.
+    ;; Setting it to NIL here will make FINALIZE-GENERIC-FUNCTION do the right thing.
+    (setf (safe-generic-function-argument-precedence-order generic-function) nil))
   (finalize-generic-function generic-function)
   ;; Update dependents
   (safe-map-dependents generic-function
@@ -2861,14 +3183,17 @@ has only has class specializer."
 (defmethod update-instance-for-different-class :after ((old forward-referenced-class) (new std-class)
                                                        &rest initargs
                                                        &key direct-superclasses direct-slots direct-default-initargs documentation)
+  (declare (ignore initargs direct-superclasses direct-slots direct-default-initargs documentation))
   nil)
 
 (defmethod update-instance-for-different-class :before
-           ((old forward-referenced-class) (new standard-class) &rest initargs)
+    ((old forward-referenced-class) (new standard-class) &rest initargs)
+  (declare (ignore initargs))
   (setf (safe-class-direct-superclasses new) (list (find-class 'standard-class))))
 
 (defmethod update-instance-for-different-class :before
-           ((old forward-referenced-class) (new funcallable-standard-class) &rest initargs)
+    ((old forward-referenced-class) (new funcallable-standard-class) &rest initargs)
+  (declare (ignore initargs))
   (setf (safe-class-direct-superclasses new) (list (find-class 'funcallable-standard-class))))
 
 (defgeneric ensure-class-using-class (class name &key &allow-other-keys))
@@ -2933,6 +3258,7 @@ has only has class specializer."
     (setf (slot-value class 'prototype) (std-allocate-instance class))))
 
 (defmethod reinitialize-instance :before ((class built-in-class) &rest args)
+  (declare (ignore args))
   (error "Cannot reinitialize built-in classes."))
 
 ;;; eql specializers.
@@ -3016,7 +3342,9 @@ has only has class specializer."
                  (list :direct-superclasses (safe-class-direct-superclasses class))
                  (list :direct-slots (mapcar #'convert-direct-slot-definition-to-canonical-direct-slot (safe-class-direct-slots class)))
                  (list :direct-default-initargs (safe-class-direct-default-initargs class))))
-  ;; Flush the EMF tables of generic functions.
+  ;; Flush the EMF tables of generic functions. (wait, why?)
+  ;; FIXME: This needs to flush the EMF tables of any accessor GFs that have
+  ;; an EMF entry for this class.
   (dolist (gf (safe-specializer-direct-generic-functions class))
     (reset-gf-emf-table gf))
   ;; Refinalize any subclasses.
@@ -3033,7 +3361,7 @@ has only has class specializer."
     (error "Cannot reinitialize sealed classes.")))
 
 (defmethod reinitialize-instance :after ((class std-class) &rest args &key direct-superclasses direct-slots direct-default-initargs documentation area sealed)
-  (declare (ignore direct-superclasses direct-slots direct-default-initargs documentation))
+  (declare (ignore direct-superclasses direct-slots direct-default-initargs documentation area sealed))
   (apply #'std-after-reinitialization-for-classes class args))
 
 (defun remove-reader-method (class reader slot-name)
@@ -3101,8 +3429,9 @@ has only has class specializer."
          (list 'shared-initialize object added-slots))
    initargs
    (lambda (valid-initargs invalid-initargs)
-     (error "Invalid initargs ~:S when updating ~S (~S) for redefined class.~%Supplied: ~:S~%valid:~:S"
-            invalid-initargs object (class-name (class-of object)) initargs valid-initargs))))
+     (error 'sys.int::simple-program-error
+            :format-control "Invalid initargs ~:S when updating ~S (~S) for redefined class.~%Supplied: ~:S~%valid: ~:S"
+            :format-arguments (list invalid-initargs object (class-name (class-of object)) initargs valid-initargs)))))
 
 (defgeneric update-instance-for-redefined-class (instance added-slots discarded-slots property-list &rest initargs &key &allow-other-keys))
 
@@ -3119,6 +3448,7 @@ has only has class specializer."
 
 (defgeneric slot-missing (class object slot-name operation &optional new-value))
 (defmethod slot-missing ((class t) object slot-name operation &optional new-value)
+  (declare (ignore new-value))
   (error "Slot ~S missing from class ~S when performing ~S." slot-name class operation))
 
 ;;; Initarg cache maintenance
@@ -3167,3 +3497,7 @@ Does not handle subclasses."
 ;; Update-instance-for-redefined-class
 (safe-add-dependent #'update-instance-for-redefined-class (make-instance 'initarg-cache-flusher :cache *u-i-f-r-c-initargs-cache*))
 (safe-add-dependent #'shared-initialize (make-instance 'initarg-cache-flusher :cache *u-i-f-r-c-initargs-cache*))
+
+(defmethod print-object ((instance class-reference) stream)
+  (print-unreadable-object (instance stream :type t :identity t)
+    (format stream "~S~:[ [undefined]~;~]" (class-reference-name instance) (class-reference-class instance))))

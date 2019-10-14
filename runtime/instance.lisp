@@ -28,6 +28,14 @@
   "Test if an instance's direct layout & tag match instance-header."
   (sys.int::%fast-instance-layout-eq-p object instance-header))
 
+(declaim (inline sys.int::instance-or-funcallable-instance-p))
+(defun sys.int::instance-or-funcallable-instance-p (object)
+  (and (sys.int::%value-has-tag-p object sys.int::+tag-object+)
+       (sys.int::%instance-or-funcallable-instance-p object)))
+
+(defun sys.int::%instance-or-funcallable-instance-p (object)
+  (sys.int::%instance-or-funcallable-instance-p object))
+
 (declaim (inline sys.int::instance-p sys.int::funcallable-instance-p))
 
 (defun sys.int::instance-p (object)
@@ -58,6 +66,7 @@
 (defun location-type (location)
   (ldb +location-type+ location))
 
+(declaim (inline location-offset-t))
 (defun location-offset-t (location)
   "Return the location offset scaled appropriately for %object-ref-t"
   (ash location -7))
@@ -151,6 +160,12 @@
 (defun (sys.int::cas instance-access-by-name) (old new object slot-name &optional (index 0))
   (sys.int::cas (instance-access object (instance-slot-location object slot-name) index) old new))
 
+(deftype sys.int::instance-header ()
+  `(satisfies sys.int::instance-header-p))
+
+(defun sys.int::instance-header-p (object)
+  (sys.int::%value-has-tag-p object sys.int::+tag-instance-header+))
+
 (defun %make-instance-header (layout &optional (tag sys.int::+object-tag-instance+))
   (check-type layout sys.int::layout)
   (with-live-objects (layout)
@@ -177,7 +192,8 @@
 (defstruct (wired-obsolete-instance-layout
              (:include obsolete-instance-layout)
              (:area :wired))
-  old-layout)
+  ;; No new slots needed here, just changing the allocation area.
+  )
 
 (defun supersede-instance (old-instance replacement)
   (let ((layout (sys.int::%instance-layout old-instance)))
@@ -222,6 +238,6 @@
   (class nil :read-only t)
   (obsolete nil)
   (heap-size nil)
-  (heap-layout nl)
+  (heap-layout nil)
   (area nil)
   (instance-slots nil))

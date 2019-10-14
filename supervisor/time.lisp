@@ -131,7 +131,7 @@
 (defstruct (timer
              (:constructor %make-timer)
              (:area :wired))
-  (name nil :read-only t)
+  name
   (next :unlinked)
   (prev :unlinked)
   %deadline
@@ -147,7 +147,12 @@
 (defun dump-active-timers ()
   (debug-print-line "Active timers: (current time is " *run-time* ")")
   (do-timer-list (timer *active-timers*)
-    (debug-print-line "  " timer "/" (timer-name timer) " @ " (timer-%deadline timer))))
+    (block nil
+      (with-page-fault-hook
+          (()
+           (debug-print-line "<truncated>")
+           (return))
+        (debug-print-line "  " timer "/" (timer-name timer) " @ " (timer-%deadline timer))))))
 
 (defun make-timer (&key name relative deadline)
   (when (and relative deadline)
@@ -213,7 +218,9 @@ Returns the number of seconds remaining if was armed or NIL if it was disarmed."
              (with-place-spinlock ((timer-queue-lock *active-timers*))
                (prog1 (timer-%deadline timer)
                  (timer-disarm-1 timer))))))
-    (convert-deadline-to-remaining-time (do-disarm))))
+    (let ((deadline (do-disarm)))
+      (when deadline
+        (convert-deadline-to-remaining-time deadline)))))
 
 (defun timer-remaining (timer)
   "Returns the number of seconds remaining if TIMER is armed or NIL if it is disarmed."
@@ -242,6 +249,7 @@ Will wait forever if TIMER has not been armed."
 
 (defun push-timer-pool (timer)
   (timer-disarm timer)
+  (setf (timer-name timer) 'pooled-timer)
   (with-mutex (*timer-pool-lock*)
     (when (< *timer-pool-size* *timer-pool-limit*)
       (setf (timer-next timer) *timer-pool*
@@ -264,10 +272,11 @@ Will wait forever if TIMER has not been armed."
     (or (alloc)
         (make-timer :name 'pooled-timer))))
 
-(defmacro with-timer ((timer &key relative absolute) &body body)
+(defmacro with-timer ((timer &key relative absolute name) &body body)
   "Allocate & arm a timer from the timer pool."
   (let ((timer-actual (gensym "TIMER")))
     `(let ((,timer-actual (pop-timer-pool)))
+       (setf (timer-name ,timer-actual) ,name)
        (unwind-protect
             (progn
               ,(when relative
@@ -277,8 +286,18 @@ Will wait forever if TIMER has not been armed."
               (let ((,timer ,timer-actual)) ,@body))
          (push-timer-pool ,timer-actual)))))
 
+(defun timer-sleep (timer seconds)
+  "Like SLEEP, but uses a pre-allocated timer."
+  (check-type seconds (real 0))
+  (unwind-protect
+       (progn
+         (timer-arm seconds timer)
+         (timer-wait timer))
+    (timer-disarm timer))
+  nil)
+
 (defun sleep (seconds)
   (check-type seconds (real 0))
-  (with-timer (timer :relative seconds)
+  (with-timer (timer :relative seconds :name 'sleep)
     (timer-wait timer))
   nil)

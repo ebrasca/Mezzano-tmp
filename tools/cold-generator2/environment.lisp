@@ -39,6 +39,7 @@
            #:function-reference
            #:function-reference-name
            #:function-reference-function
+           #:function-reference-documentation
            #:make-function
            #:compile-lap
            #:cross-compiled-function
@@ -58,6 +59,8 @@
            ;; Heap layout, not a layout object.
            #:structure-definition-layout
            #:structure-definition-sealed
+           #:structure-definition-docstring
+           #:structure-definition-has-standard-constructor
            #:make-structure-slot-definition
            #:structure-slot-definition
            #:structure-slot-definition-name
@@ -68,6 +71,7 @@
            #:structure-slot-definition-location
            #:structure-slot-definition-fixed-vector
            #:structure-slot-definition-align
+           #:structure-slot-definition-documentation
            #:make-instance-header
            #:instance-header
            #:instance-header-object
@@ -150,8 +154,9 @@
 
 (defclass function-reference ()
   ((%name :initarg :name :reader function-reference-name)
-   (%function :initarg :function :accessor function-reference-function))
-  (:default-initargs :function nil))
+   (%function :initarg :function :accessor function-reference-function)
+   (documentation :initarg :documentation :accessor function-reference-documentation))
+  (:default-initargs :function nil :documentation nil))
 
 (defmethod print-object ((object function-reference) stream)
   (print-unreadable-object (object stream :type t :identity t)
@@ -187,9 +192,11 @@
    (%size :initarg :size :reader structure-definition-size)
    (%layout :initarg :layout :accessor structure-definition-layout)
    (%sealed :initarg :sealed :reader structure-definition-sealed)
+   (%docstring :initarg :docstring :reader structure-definition-docstring)
+   (%has-standard-constructor :initarg :has-standard-constructor :reader structure-definition-has-standard-constructor)
    (%native-class :initform nil :accessor structure-definition-native-class)))
 
-(defun make-structure-definition (environment name slots parent area size layout sealed)
+(defun make-structure-definition (environment name slots parent area size layout sealed docstring has-standard-constructor)
   (declare (ignore environment))
   ;; FIXME: Copy slots list & layout to wired area.
   (check-type name symbol)
@@ -201,7 +208,9 @@
                  :area area
                  :size size
                  :layout layout
-                 :sealed sealed))
+                 :sealed sealed
+                 :docstring docstring
+                 :has-standard-constructor has-standard-constructor))
 
 (defmethod print-object ((object structure-definition) stream)
   (print-unreadable-object (object stream :type t :identity t)
@@ -273,9 +282,10 @@
    (%read-only :initarg :read-only :reader structure-slot-definition-read-only)
    (%location :initarg :location :reader structure-slot-definition-location)
    (%fixed-vector :initarg :fixed-vector :reader structure-slot-definition-fixed-vector)
-   (%align :initarg :align :reader structure-slot-definition-align)))
+   (%align :initarg :align :reader structure-slot-definition-align)
+   (%documentation :initarg :documentation :reader structure-slot-definition-documentation)))
 
-(defun make-structure-slot-definition (environment name accessor initform type read-only location fixed-vector align)
+(defun make-structure-slot-definition (environment name accessor initform type read-only location fixed-vector align documentation)
   (declare (ignore environment))
   (make-instance 'structure-slot-definition
                  :name name
@@ -285,7 +295,8 @@
                  :read-only read-only
                  :location location
                  :fixed-vector fixed-vector
-                 :align align))
+                 :align align
+                 :documentation documentation))
 
 (defmethod print-object ((object structure-slot-definition) stream)
   (print-unreadable-object (object stream :type t :identity t)
@@ -297,7 +308,8 @@
                   :read-only (structure-slot-definition-read-only object)
                   :location (structure-slot-definition-location object)
                   :fixed-vector (structure-slot-definition-fixed-vector object)
-                  :align (structure-slot-definition-align object)))))
+                  :align (structure-slot-definition-align object)
+                  :documentation (structure-slot-definition-documentation object)))))
 
 (defclass instance-header ()
   ((%object :initarg :object :reader instance-header-object)))
@@ -337,10 +349,12 @@
 (defmethod object-area (environment object)
   (values (gethash object (environment-object-area-table environment))))
 
-(defun symbol-global-value-cell (environment symbol)
+(defun symbol-global-value-cell (environment symbol &optional (create t))
   (check-type symbol symbol)
   (let ((cell (gethash symbol (environment-symbol-global-value-cell-table environment))))
-    (when (not cell)
+    (when (and (not cell)
+               (or (keywordp symbol)
+                   create))
       (setf cell (make-instance 'symbol-value-cell :symbol symbol)
             (gethash symbol (environment-symbol-global-value-cell-table environment)) cell)
       (when (keywordp symbol)
@@ -354,10 +368,14 @@
   (setf (symbol-value-cell-value (symbol-global-value-cell environment symbol)) value))
 
 (defun symbol-global-boundp (environment symbol)
-  (slot-boundp (symbol-global-value-cell environment symbol) '%value))
+  (let ((cell (symbol-global-value-cell environment symbol nil)))
+    (and cell
+         (slot-boundp cell '%value))))
 
 (defun symbol-global-makunbound (environment symbol)
-  (slot-makunbound (symbol-global-value-cell environment symbol) '%value))
+  (let ((cell (symbol-global-value-cell environment symbol nil)))
+    (when cell
+      (slot-makunbound cell '%value))))
 
 (defun cross-symbol-name (environment symbol)
   ;; Make sure symbol names are in the wired area.
@@ -449,8 +467,10 @@
 (defun function-makunbound (environment name)
   (slot-makunbound (function-reference environment name) '%function))
 
-(defun %defun (environment name value)
-  (setf (function-reference-function (function-reference environment name)) value)
+(defun %defun (environment name value &optional documentation)
+  (let ((fref (function-reference environment name)))
+    (setf (function-reference-function fref) value
+          (function-reference-documentation fref) documentation))
   name)
 
 (defun function-reference (environment name &optional (createp t))
@@ -518,11 +538,13 @@
 (defun cross-array-element-type (environment array)
   (values (gethash array (environment-array-element-type-table environment) 't)))
 
-(defclass instance-class (standard-class)
-  ((%sdef :initarg :sdef :reader instance-class-structure-definition)))
+;; ECL seems to do some DEFCLASS processing at compile time & fails without this
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defclass instance-class (standard-class)
+    ((%sdef :initarg :sdef :reader instance-class-structure-definition)))
 
-(defmethod c2mop:validate-superclass ((class instance-class) (superclass standard-class))
-  t)
+  (defmethod c2mop:validate-superclass ((class instance-class) (superclass standard-class))
+    t))
 
 (defclass instance-object (standard-object)
   ()

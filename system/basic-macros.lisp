@@ -109,7 +109,8 @@
            (tagbody ,head
               (if (null ,itr)
                   (return (let ((,var nil))
-                            (declare ,@declares)
+                            (declare ,@declares
+                                     (ignorable ,var))
                             ,result-form)))
               (let ((,var (car ,itr)))
                 (declare ,@declares)
@@ -160,7 +161,7 @@
 (defmacro case (keyform &body cases)
   (let ((test-key (gensym "CASE-KEY")))
     `(let ((,test-key ,keyform))
-       (declare (ignoreable ,test-key))
+       (declare (ignorable ,test-key))
        (cond
          ,@(mapcar (lambda (clause)
                      (declare (type cons clause))
@@ -238,7 +239,7 @@
   (let ((test-key (gensym "CASE-KEY"))
         (all-keys '()))
     `(let ((,test-key ,keyform))
-       (declare (ignoreable ,test-key))
+       (declare (ignorable ,test-key))
        (cond
          ,@(mapcar (lambda (clause)
                      (declare (type cons clause))
@@ -359,7 +360,7 @@
 (defmacro typecase (keyform &rest cases)
   (let ((test-key (gensym "CASE-KEY")))
     `(let ((,test-key ,keyform))
-       (declare (ignoreable ,test-key))
+       (declare (ignorable ,test-key))
        (cond
          ,@(mapcar (lambda (clause)
                      (declare (type cons clause))
@@ -375,7 +376,7 @@
 (defmacro etypecase (keyform &rest cases)
   (let ((test-key (gensym "CASE-KEY")))
     `(let ((,test-key ,keyform))
-       (declare (ignoreable ,test-key))
+       (declare (ignorable ,test-key))
        (cond
          ,@(mapcar (lambda (clause)
                      (declare (type cons clause))
@@ -440,33 +441,39 @@
 
 (defmacro prog2 (first-form second-form &rest forms)
   "Evaluate FIRST-FORM, SECOND-FORM, then FORMS in order; returning the value of SECOND-FORM."
-  (let ((sym (gensym)))
-    `(prog1 (progn ,first-form ,second-form) ,@forms)))
+  `(prog1 (progn ,first-form ,second-form) ,@forms))
 
 (defmacro declaim (&rest declaration-specifiers)
   `(eval-when (:compile-toplevel :load-toplevel :execute)
      ,@(mapcar (lambda (x) `(proclaim ',x)) declaration-specifiers)))
 
 ;;; DEFVAR.
-(defmacro defvar (name &optional (initial-value nil initial-valuep) docstring)
-  (if initial-valuep
-      `(progn
-         (declaim (special ,name))
-         (unless (boundp ',name)
-           (setq ,name ,initial-value))
-         ',name)
-      `(progn
-         (declaim (special ,name))
-         ',name)))
+(defmacro defvar (name &optional (initial-value nil initial-valuep) (docstring nil docstringp))
+  (when docstringp
+    (check-type docstring string))
+  `(progn
+     (declaim (special ,name))
+     ,@(when initial-valuep
+         `((unless (boundp ',name)
+             (setq ,name ,initial-value))))
+     ,@(when docstringp
+         `((set-variable-docstring ',name ',docstring)))
+     ',name))
 
 ;;; DEFPARAMETER.
-(defmacro defparameter (name initial-value &optional docstring)
+(defmacro defparameter (name initial-value &optional (docstring nil docstringp))
+  (when docstringp
+    (check-type docstring string))
   `(progn
      (declaim (special ,name))
      (setq ,name ,initial-value)
+     ,@(when docstringp
+         `((set-variable-docstring ',name ',docstring)))
      ',name))
 
-(defmacro defconstant (name initial-value &optional docstring)
+(defmacro defconstant (name initial-value &optional (docstring nil docstringp))
+  (when docstringp
+    (check-type docstring string))
   `(eval-when (:compile-toplevel :load-toplevel :execute)
      (%defconstant ',name ,initial-value
                    ,@(when docstring `(',docstring)))))
@@ -475,16 +482,17 @@
   `(eval-when (:compile-toplevel :load-toplevel :execute)
      (%define-symbol-macro ',symbol ',expansion)))
 
-(defmacro defglobal (name &optional (initial-value nil initial-valuep) docstring)
-  (if initial-valuep
-      `(progn
-         (declaim (global ,name))
-         (unless (boundp ',name)
-           (setq ,name ,initial-value))
-         ',name)
-      `(progn
-         (declaim (global ,name))
-         ',name)))
+(defmacro defglobal (name &optional (initial-value nil initial-valuep) (docstring nil docstringp))
+  (when docstringp
+    (check-type docstring string))
+  `(progn
+     (declaim (global ,name))
+     ,@(when initial-valuep
+         `((unless (boundp ',name)
+             (setq ,name ,initial-value))))
+     ,@(when docstringp
+         `((set-variable-docstring ',name ',docstring)))
+     ',name))
 
 (defmacro defun (&environment env name lambda-list &body body)
   (let ((base-name (if (consp name)
@@ -502,7 +510,7 @@
            ;; Don't emit source information if there's an environment.
            ;; Currently inlining a DEFUN defined in a macrolet doesn't work.
            (%compiler-defun ',name ',(if env 'nil the-lambda)))
-         (%defun ',name ,the-lambda)
+         (%defun ',name ,the-lambda ',docstring)
          ',name)))))
 
 (defmacro prog (variables &body body)
@@ -529,3 +537,14 @@
   (if vars
       `(values (setf (values ,@vars) ,form))
       `(values ,form)))
+
+(defmacro unwind-protect-unwind-only (protected-form &body cleanup-forms)
+  "Like UNWIND-PROTECT, but CLEANUP-FORMS are not executed if a normal return occurs."
+  (let ((abnormal-return (gensym "ABNORMAL-RETURN")))
+    `(let ((,abnormal-return t))
+       (unwind-protect
+            (multiple-value-prog1
+                ,protected-form
+              (setf ,abnormal-return nil))
+         (when ,abnormal-return
+           ,@cleanup-forms)))))

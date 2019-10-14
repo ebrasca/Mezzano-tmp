@@ -101,16 +101,8 @@
            #:ast-protected-form
            #:ast-cleanup-function
            #:ast-arguments
-           #:ast-targets
-
-           #:with-metering
-           #:reset-meters)
+           #:ast-targets)
   (:use :cl))
-
-(defpackage :mezzano.compiler.codegen.x86-64
-  (:use :cl :mezzano.compiler)
-  (:export #:codegen-lambda
-           #:generate-builtin-functions))
 
 (defpackage :mezzano.lap.arm64
   (:documentation "arm64 assembler for LAP.")
@@ -119,12 +111,6 @@
 (defpackage :mezzano.lap.ppc64le
   (:documentation "ppc64le assembler for LAP.")
   (:use :cl))
-
-(defpackage :mezzano.compiler.codegen.arm64
-  (:use :cl :mezzano.compiler)
-  (:local-nicknames (:lap :mezzano.lap.arm64))
-  (:export #:codegen-lambda
-           #:generate-builtin-functions))
 
 (defpackage :system.internals
   (:nicknames :sys.int)
@@ -220,6 +206,11 @@
            #:structure-slot-definition-read-only
            #:structure-slot-definition-fixed-vector
            #:structure-slot-definition-align
+
+           #:+slot-unbound+
+
+           #:standard-instance-access
+           #:funcallable-standard-instance-access
            ))
 
 ;;; Supervisor manages the hardware, doing paging and memory management.
@@ -303,6 +294,7 @@
            #:condition-variable-p
            #:make-condition-variable
            #:condition-wait
+           #:condition-wait-for
            #:condition-notify
            #:latch
            #:latch-p
@@ -311,6 +303,7 @@
            #:latch-wait
            #:latch-trigger
            #:snapshot
+           #:wait-for-snapshot-completion
            #:allocate-memory-range
            #:protect-memory-range
            #:release-memory-range
@@ -345,6 +338,7 @@
            #:with-symbol-spinlock
            #:map-physical-memory
            #:add-deferred-boot-action
+           #:logical-core-count
 
            #:boot-uuid
            #:boot-field
@@ -382,11 +376,13 @@
            #:safe-sleep
            #:read-rtc-time
            #:all-disks
+           #:disk
            #:disk-writable-p
            #:disk-n-sectors
            #:disk-sector-size
            #:disk-read
            #:disk-write
+           #:disk-flush
            #:disk-name
            #:make-disk-request
            #:disk-submit-request
@@ -414,6 +410,16 @@
 
            #:wait-for-objects
            #:get-object-event
+           #:watcher
+           #:watcher-p
+           #:with-watcher
+           #:make-watcher
+           #:watcher-name
+           #:watcher-destroy
+           #:watcher-add-object
+           #:watcher-remove
+           #:watcher-objects
+           #:watcher-wait
 
            #:event
            #:event-p
@@ -421,6 +427,7 @@
            #:event-name
            #:event-state
            #:event-wait
+           #:event-wait-for
 
            #:timer
            #:timer-p
@@ -434,6 +441,11 @@
            #:timer-wait
            #:timer-expired-p
            #:with-timer
+           #:timer-sleep
+
+           #:thread-thread-pool
+           #:thread-pool-block
+           #:inhibit-thread-pool-blocking-hijack
            ))
 
 ;;; Runtime contains a bunch of low-level and common functions required to

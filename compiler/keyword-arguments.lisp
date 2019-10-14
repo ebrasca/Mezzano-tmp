@@ -92,10 +92,6 @@
                              :inherit form
                              :name (gensym "ALLOW-OTHER-KEYS")
                              :definition-point *current-lambda*))
-         (aok-itr (make-instance 'lexical-variable
-                                 :inherit form
-                                 :name (gensym)
-                                 :definition-point *current-lambda*))
          (itr (make-instance 'lexical-variable
                              :inherit form
                              :name (gensym)
@@ -124,14 +120,17 @@
                                      'sys.int::simple-program-error
                                      ':format-control '"Unknown &KEY argument ~S. Expected one of ~S."
                                      ':format-arguments (call list ,current-keyword (quote ,(mapcar 'caar keys)))))))))
+             (bind-variable (name value)
+               (list name
+                     (wrap-type-check name (ast value form))))
              (create-key-let-body (key-args values suppliedp)
                (cond (key-args
-                      `(let ((,(second (first (first key-args)))
-                              (if ,(first suppliedp)
-                                  ,(first values)
-                                  ,(second (first key-args)))))
+                      `(let (,(bind-variable (second (first (first key-args)))
+                                             `(if ,(first suppliedp)
+                                                  ,(first values)
+                                                  ,(second (first key-args)))))
                          ,(if (third (first key-args))
-                              `(let ((,(third (first key-args)) ,(first suppliedp)))
+                              `(let (,(bind-variable (third (first key-args)) (first suppliedp)))
                                  ,(create-key-let-body (rest key-args) (rest values) (rest suppliedp)))
                               (create-key-let-body (rest key-args) (rest values) (rest suppliedp)))))
                      (t body))))
@@ -191,9 +190,8 @@
 
 (defun lower-keyword-arguments (form architecture)
   (declare (ignore architecture))
-  (with-metering (:lower-keyword-arguments)
-    (lower-keyword-arguments-1 form)
-    form))
+  (lower-keyword-arguments-1 form)
+  form)
 
 (defgeneric lower-keyword-arguments-1 (form))
 

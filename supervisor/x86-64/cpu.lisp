@@ -148,14 +148,17 @@ The bootloader is loaded to #x7C00, so #x7000 should be safe.")
                                                               vector)))
 
 (defun broadcast-ipi (type vector &optional including-self)
-  ;; Disable interrupts to prevent cross-cpu migration from
-  ;; fouling up behaviour of INCLUDING-SELF.
-  (safe-without-interrupts (type vector including-self)
-    (dolist (cpu *cpus*)
-      (when (and (eql (cpu-state cpu) :online)
-                 (or including-self
-                     (not (eql cpu (local-cpu-object)))))
-        (send-ipi (cpu-apic-id cpu) type vector)))))
+  ;; BROADCAST-IPI can be called very early due to thread wakeups, before
+  ;; the lapic is mapped by INITIALIZE-CPU.
+  (when *lapic-address*
+    ;; Disable interrupts to prevent cross-cpu migration from
+    ;; fouling up behaviour of INCLUDING-SELF.
+    (safe-without-interrupts (type vector including-self)
+      (dolist (cpu *cpus*)
+        (when (and (eql (cpu-state cpu) :online)
+                   (or including-self
+                       (not (eql cpu (local-cpu-object)))))
+          (send-ipi (cpu-apic-id cpu) type vector))))))
 
 (defun broadcast-wakeup-ipi ()
   (broadcast-ipi +ipi-type-fixed+ +wakeup-ipi-vector+))
@@ -231,6 +234,9 @@ Protected by the world stop lock."
 
 ;; TODO: This unconditionally invalidates the entire TLB.
 ;; Should be more fine-grained.
+
+(defun check-tlb-shootdown-not-in-progress ()
+  (ensure (not *tlb-shootdown-in-progress*) "TLB shootdown in progress!"))
 
 (defun begin-tlb-shootdown ()
   "Bring all CPUs to state ready for TLB shootdown.
@@ -851,6 +857,9 @@ This is a one-shot timer and must be reset after firing."
    (truncate (* duration-internal-time-units *lapic-timer-calibration*)
              internal-time-units-per-second)))
 
+(defun initialize-early-cpu ()
+  (setf *lapic-address* nil))
+
 (defun initialize-cpu ()
   (setf *lapic-address* (logand (sys.int::msr +msr-ia32-apic-base+)
                                 (lognot #xFFF)))
@@ -970,6 +979,9 @@ This is a one-shot timer and must be reset after firing."
   (dolist (cpu *cpus*)
     (when (eql (cpu-state cpu) :offline)
       (boot-cpu cpu))))
+
+(defun logical-core-count ()
+  (length *cpus*))
 
 (in-package :sys.int)
 

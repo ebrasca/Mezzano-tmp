@@ -9,12 +9,26 @@
 (defconstant +arp-hrd-ethernet+ 1)
 
 (defvar *arp-expiration-time* 600)
+(defvar *arp-expiration-timer* nil)
 ;;; The ARP table is a list of lists. Each list holds:
-;;; (protocol-type protocol-address network-address age)
-(defvar *arp-table* nil)
+;;; (protocol-type protocol-address network-address expiration-time)
+(defvar *arp-table* '())
 (defvar *arp-lock* (mezzano.supervisor:make-mutex "ARP routing table."))
 
-(defun arp-receive (interface packet)
+(defun update-arp-expiration-timer ()
+  (if *arp-table*
+      (loop :with min-time := (fourth (car *arp-table*))
+            :for arp :in *arp-table*
+            :for arp-expiration-time := (fourth arp)
+            :while (< arp-expiration-time min-time)
+            :do (setf min-time arp-expiration-time)
+            :finally (mezzano.supervisor:timer-arm (- min-time (get-universal-time))
+                                                   *arp-expiration-timer*))
+      (mezzano.supervisor:timer-disarm *arp-expiration-timer*)))
+
+(defmethod mezzano.network.ethernet:ethernet-receive
+    ((ethertype (eql mezzano.network.ethernet:+ethertype-arp+))
+     interface packet start end)
   (let* ((htype (ub16ref/be packet 14))
          (ptype (ub16ref/be packet 16))
          (hlen (aref packet 18))
@@ -24,16 +38,15 @@
          (spa-start (+ sha-start hlen))
          (tha-start (+ spa-start plen))
          (tpa-start (+ tha-start hlen))
-         (packet-end (+ tpa-start plen))
          (merge-flag nil)
-         (address (mezzano.network.ip::ipv4-address-address
-                   (mezzano.network.ip:ipv4-interface-address interface nil))))
+         (interface-address (mezzano.network.ip:ipv4-interface-address interface nil))
+         (address (and interface-address
+                       (mezzano.network.ip::ipv4-address-address interface-address))))
     ;; Ethernet hardware type and IPv4.
     (when (and (eql htype +arp-hrd-ethernet+) (eql hlen 6)
                (eql ptype mezzano.network.ethernet:+ethertype-ipv4+) (eql plen 4))
       (let ((spa (ub32ref/be packet spa-start))
             (tpa (ub32ref/be packet tpa-start)))
-        (format t "Got ARP packet. ~X ~X ~X ~X~%" spa tpa address oper)
         ;; If the pair <protocol type, sender protocol address> is
         ;; already in my translation table, update the sender
         ;; hardware address field of the entry with the new
@@ -41,15 +54,21 @@
         (dolist (e *arp-table*)
           (when (and (eql (first e) ptype)
                      (eql (second e) spa))
-            (setf (third e) (subseq packet sha-start spa-start)
-                  merge-flag t)
+            (mezzano.supervisor:with-mutex (*arp-lock*)
+              (setf (third e) (subseq packet sha-start spa-start)
+                    (fourth e) (+ *arp-expiration-time* (get-universal-time))
+                    merge-flag t))
+            #+(or)
+            (update-arp-expiration-timer)
             (return)))
         (when (and address (eql tpa address))
           (unless merge-flag
             (mezzano.supervisor:with-mutex (*arp-lock*)
               (push (list ptype spa (subseq packet sha-start spa-start)
                           (+ *arp-expiration-time* (get-universal-time)))
-                    *arp-table*)))
+                    *arp-table*))
+            #+(or)
+            (update-arp-expiration-timer))
           (when (eql oper +arp-op-request+)
             ;; Copy source hardware address to dest MAC and target h/w address.
             (dotimes (i 6)
@@ -66,8 +85,7 @@
             (setf (ub32ref/be packet spa-start) address
                   (ub16ref/be packet 20) +arp-op-reply+)
             (mezzano.network.ethernet:transmit-packet interface (list (subseq packet 0 44))))))
-      (mezzano.network.ip::arp-table-updated))
-    (format t "New ARP table: ~S~%" *arp-table*)))
+      (mezzano.network.ip::arp-table-updated))))
 
 (defun send-arp (interface ptype address)
   "Send an ARP packet out onto the wire."
@@ -112,20 +130,10 @@ Returns NIL if there is no entry currently in the cache, this will trigger a loo
   (send-arp interface ptype address)
   nil)
 
-(defun start-arp-expiration ()
-  (mezzano.supervisor:make-thread
-   #'(lambda ()
-       (loop :do (let ((time (get-universal-time)))
-                   (mezzano.supervisor:with-mutex (*arp-lock*)
-                     (setf *arp-table* (remove-if #'(lambda (arp)
-                                                      (>= time (fourth arp)))
-                                                  *arp-table*)))
-                   (if *arp-table*
-                       (loop :with min-time := (fourth (car *arp-table*))
-                             :for arp :in *arp-table*
-                             :for arp-expiration-time := (fourth arp)
-                             :while (< arp-expiration-time min-time)
-                             :do (setf min-time arp-expiration-time)
-                             :finally (sleep (- min-time time)))
-                       (sleep *arp-expiration-time*)))))
-   :name "ARP expiration"))
+(defun arp-expiration ()
+  (let ((time (1+ (get-internal-real-time))))
+    (mezzano.supervisor:with-mutex (*arp-lock*)
+      (setf *arp-table* (remove-if #'(lambda (arp)
+                                       (>= time (fourth arp)))
+                                   *arp-table*)))
+    (update-arp-expiration-timer)))

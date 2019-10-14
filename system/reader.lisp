@@ -9,6 +9,7 @@
 (defvar *read-suppress* nil)
 
 (defvar *read-lookahead-table*)
+(defvar *read-package* nil)
 
 (declaim (special *readtable* *standard-readtable*)
          (type readtable *readtable* *standard-readtable*))
@@ -38,7 +39,7 @@
     (set-syntax-from-char (code-char i) (code-char i) to-readtable from-readtable))
   (clrhash (readtable-extended-characters to-readtable))
   (maphash (lambda (k v)
-             (declare (ignore))
+             (declare (ignore v))
              (set-syntax-from-char k k to-readtable from-readtable))
            (readtable-extended-characters from-readtable))
   to-readtable)
@@ -190,8 +191,8 @@
                ;; is seen. Treat single escape characters as above.
                (do ((y (read-char stream t nil t)
                        (read-char stream t nil t)))
-                   ((multiple-escape-p y))
-                 (when (single-escape-p y)
+                   ((eql (readtable-syntax-type y) :multiple-escape))
+                 (when (eql (readtable-syntax-type y) :single-escape)
                    (read-char stream t nil t)))))))
     (return-from read-token nil))
   ;; Normal read code, without *READ-SUPPRESS* enabled
@@ -247,7 +248,10 @@
                            token (make-array 16
                                              :element-type 'character
                                              :adjustable t
-                                             :fill-pointer 0)))))
+                                             :fill-pointer 0))))
+               ;; Reset seen-escape here, done reading the package
+               ;; half of the token, on to the symbol name.
+               (setf seen-escape nil))
               (t (vector-push-extend (case-correct x) token)))))
     ;; Check for invalid uses of the dot. Tokens that are constructed
     ;; entirely from dots are invalid unless one or more of the dots was
@@ -263,6 +267,15 @@
         (when (eql (char token offset) #\.)
           (incf dot-count))))
     (cond
+      ;; If no escapes were seen, a double-package marker was seen,
+      ;; and the symbol name is empty then we're reading SBCL's
+      ;; extended package prefix syntax.
+      ((and (not seen-escape)
+            package-name
+            intern-symbol
+            (zerop (length token)))
+       (let ((*read-package* (find-package-or-die package-name)))
+         (read stream t nil t)))
       ;; Return a symbol immediately if a package marker was seen.
       (package-name
        (if (or intern-symbol (string= "KEYWORD" package-name))
@@ -276,12 +289,12 @@
       ;; If an escape character was seen, then do not try to parse the token as
       ;; an number, intern it and return it immediately.
       (seen-escape
-       (intern token))
+       (intern token *read-package*))
       ;; Attempt to parse a number.
       (t (or (read-integer token)
              (read-float token)
              (read-ratio token stream)
-             (intern token))))))
+             (intern token *read-package*))))))
 
 (defun read-ratio (string stream)
   ;; ratio = sign? digits+ slash digits+
@@ -337,7 +350,9 @@
       (error 'simple-reader-error :stream stream
              :format-control "Invalid ratio, dividing by zero: ~A"
              :format-arguments (list string)))
-    (/ numerator denominator)))
+    (if negativep
+        (- (/ numerator denominator))
+        (/ numerator denominator))))
 
 (defvar *exponent-markers* "DdEeFfLlSs")
 (defvar *decimal-digits* "0123456789")
@@ -529,7 +544,6 @@
 
 (defun read-right-parenthesis (stream first)
   "Signals a reader-error when an unexpected #\) is seen."
-  (declare (ignore stream))
   (error 'simple-reader-error :stream stream
          :format-control "Unexpected ~S."
          :format-arguments (list first)))
@@ -660,14 +674,14 @@
                    (when (or (get-macro-character z) (whitespace[2]p z))
                      (unread-char z stream)
                      t)))
-            (let ((syntax (readtable-syntax-type x)))
+            (let ((syntax (readtable-syntax-type z)))
               (cond ((eql syntax :single-escape)
                      (vector-push-extend (read-char stream t nil t) token))
                     ((eql syntax :multiple-escape)
                      (do ((y (read-char stream t nil t)
                              (read-char stream t nil t)))
-                         ((multiple-escape-p y))
-                       (if (single-escape-p y)
+                         ((eql (readtable-syntax-type y) :multiple-escape))
+                       (if (eql (readtable-syntax-type y) :single-escape)
                            (vector-push-extend (read-char stream t nil t) token)
                            (vector-push-extend y token))))
                     (t (vector-push-extend (case-correct z) token)))))
@@ -770,6 +784,36 @@
         (setf current-dim (elt current-dim 0))))
     (make-array dimensions :initial-contents object)))
 
+(defun read-#-struct (stream ch p)
+  (declare (notinline slot-value make-instance)) ; bootstrap hack
+  (ignore-#-argument ch p)
+  (cond (*read-suppress*
+         (read stream t nil t)
+         nil)
+        (*read-eval*
+         (let* ((form (read stream t nil t))
+                (structure-name (first form))
+                (class (find-class structure-name nil)))
+           (when (or (not class)
+                     (not (typep class 'structure-class)))
+             (error 'simple-reader-error :stream stream
+                    :format-control "~S does not name a structure class"
+                    :format-arguments (list structure-name)))
+           (when (not (slot-value class 'mezzano.clos::has-standard-constructor))
+             (error 'simple-reader-error :stream stream
+                    :format-control "Structure class ~S does not have a standard constructor"
+                    :format-arguments (list structure-name)))
+           (apply #'make-instance class
+                  ;; Convert slot names to keywords.
+                  (loop
+                     for (slot value) on (rest form) by #'cddr
+                     collect (intern (string slot) (find-package 'keyword))
+                     collect value))))
+        ;; The #S syntax is equivalent to #., so presumably obeys *READ-EVAL*.
+        (t (error 'simple-reader-error :stream stream
+                  :format-control "Cannot #S when *READ-EVAL* is false."
+                  :format-arguments '()))))
+
 (defun read-#-pathname (stream ch p)
   (ignore-#-argument ch p)
   (cond (*read-suppress*
@@ -795,7 +839,8 @@
 
 (defun read-#-features (stream suppress-if-false)
   "Common function to implement #+ and #-."
-  (let* ((test (let ((*package* (find-package "KEYWORD")))
+  (let* ((test (let* ((*package* (find-package "KEYWORD"))
+                      (*read-package* *package*))
                  (read stream t nil t)))
          (*read-suppress* (or *read-suppress*
                               (if suppress-if-false
@@ -832,7 +877,7 @@
 
 (defun read-#-invalid (stream ch p)
   "Handle explicitly invalid # dispatch characters."
-  (declare (ignore stream p))
+  (declare (ignore p))
   (error 'simple-reader-error :stream stream
          :format-control "Illegal syntax #~A."
          :format-arguments (list ch)))
@@ -860,7 +905,10 @@
 (defun read-common (stream eof-error-p eof-value recursive-p)
   (let ((*read-lookahead-table* (if recursive-p
                                     *read-lookahead-table*
-                                    (make-hash-table))))
+                                    (make-hash-table)))
+        (*read-package* (or (and recursive-p
+                                 *read-package*)
+                            *package*)))
     ;; Skip leading whitespace.
     (loop (let ((c (read-char stream eof-error-p 'nil t)))
             (when (eql c 'nil)
