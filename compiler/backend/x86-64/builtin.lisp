@@ -142,7 +142,7 @@
                             backend-function inst
                             defs
                             (ir:call-arguments inst)))
-            (return-from lower-predicate-builtin (values nil nil)))
+            (return-from lower-predicate-builtin nil))
           (let ((pred (first (builtin-result-list builtin))))
             (ir:insert-before
              backend-function inst
@@ -154,12 +154,13 @@
             (let ((advance (ir:next-instruction backend-function next-inst)))
               (ir:remove-instruction backend-function inst)
               (ir:remove-instruction backend-function next-inst)
-              (values advance t))))))))
+              advance)))))))
 
 (defun lower-builtin (backend-function inst defs)
-  (let ((builtin (and (typep inst '(or ir:call-instruction
-                                       ir:call-multiple-instruction
-                                       ir:tail-call-instruction))
+  (let ((builtin (and (typep inst '(or
+                                    ir:call-instruction
+                                    ir:call-multiple-instruction
+                                    ir:tail-call-instruction))
                       (match-builtin (ir:call-function inst)
                                      (length (ir:call-arguments inst))))))
     (when builtin
@@ -224,11 +225,7 @@
     (do* ((inst (ir:first-instruction backend-function) next-inst)
           (next-inst (ir:next-instruction backend-function inst) (if inst (ir:next-instruction backend-function inst))))
          ((null inst))
-      (multiple-value-bind (next did-something)
-          (lower-predicate-builtin backend-function inst uses defs)
-        (cond (did-something
-               (setf next-inst next))
-              (t
-               (let ((next (lower-builtin backend-function inst defs)))
-                 (when next
-                   (setf next-inst next)))))))))
+      (let ((next (or (lower-predicate-builtin backend-function inst uses defs)
+                      (lower-builtin backend-function inst defs))))
+        (when next
+          (setf next-inst next))))))
