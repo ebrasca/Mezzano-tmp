@@ -16,7 +16,7 @@
   name)
 
 (defmacro define-instruction (name lambda-list &body body)
-  (let ((fname (read-from-string (format nil "~s-assembler" name))))
+  (let ((fname (intern (format nil "~:@(~a~)-ASSEMBLER" name))))
     `(progn
        (defun ,fname ,lambda-list
          ,@body)
@@ -479,7 +479,7 @@
 
 ;; store doubleword
 (define-instruction std (rs ds ra)
-  (ds-form 62 rs ra d 0))
+  (ds-form 62 rs ra ds 0))
 
 ;; store doubleword with update
 (define-instruction stdu (rs ds ra)
@@ -1072,11 +1072,11 @@
   (x-form 31 rs ra rb 508))
 
 ;; population count bytes
-(define-instruction popcntb (ra  rs)
+(define-instruction popcntb (ra rs)
   (x-form 31 rs ra 0 122))
 
 ;; population count words
-(define-instruction popcntw (ra  rs)
+(define-instruction popcntw (ra rs)
   (x-form 31 rs ra 0 378))
 
 ;; parity doubleword
@@ -1137,26 +1137,26 @@
 (define-instruction rlwimi. (ra rs sh mb me)
   (m-form 20 rs ra sh mb me 1))
 
-;; rotate left doubleword immediate then clear left
-(define-instruction rldicl (ra rs sh mb)
-  (md-form 30 rs ra sh mb 0 0))
+;; ;; rotate left doubleword immediate then clear left
+;; (define-instruction rldicl (ra rs sh mb)
+;;   (md-form 30 rs ra sh mb 0 0))
 
-(define-instruction rldicl. (ra rs sh mb)
-  (md-form 30 rs ra sh mb 0 1))
+;; (define-instruction rldicl. (ra rs sh mb)
+;;   (md-form 30 rs ra sh mb 0 1))
 
-;; rotate left doubleword immediate then clear right
-(define-instruction rldicr (ra rs sh me)
-  (md-form 30 rs ra sh me 1 0))
+;; ;; rotate left doubleword immediate then clear right
+;; (define-instruction rldicr (ra rs sh me)
+;;   (md-form 30 rs ra sh me 1 0))
 
-(define-instruction rldicr. (ra rs sh me)
-  (md-form 30 rs ra sh me 1 1))
+;; (define-instruction rldicr. (ra rs sh me)
+;;   (md-form 30 rs ra sh me 1 1))
 
-;; rotate left doubleword immediate then clear
-(define-instruction rldic (ra rs sh mb)
-  (md-form 30 rs ra sh mb 2 0))
+;; ;; rotate left doubleword immediate then clear
+;; (define-instruction rldic (ra rs sh mb)
+;;   (md-form 30 rs ra sh mb 2 0))
 
-(define-instruction rldic. (ra rs sh mb)
-  (md-form 30 rs ra sh mb 2 1))
+;; (define-instruction rldic. (ra rs sh mb)
+;;   (md-form 30 rs ra sh mb 2 1))
 
 ;; rotate left doubleword then clear left
 (define-instruction rldcl (ra rs rb mb)
@@ -1172,12 +1172,12 @@
 (define-instruction rldcr. (ra rs rb me)
   (mds-form 30 rs ra rb me 9 1))
 
-;; rotate left doubleword immediate then mask insert
-(define-instruction rldimi (ra rs sh mb)
-  (md-form 30 rs ra sh mb 3 0))
+;; ;; rotate left doubleword immediate then mask insert
+;; (define-instruction rldimi (ra rs sh mb)
+;;   (md-form 30 rs ra sh mb 3 0))
 
-(define-instruction rldimi. (ra rs sh mb)
-  (md-form 30 rs ra sh mb 3 1))
+;; (define-instruction rldimi. (ra rs sh mb)
+;;   (md-form 30 rs ra sh mb 3 1))
 
 ;; shift left word
 (define-instruction slw (ra rs rb)
@@ -1221,12 +1221,12 @@
 (define-instruction srd. (ra rs rb)
   (x-form 31 rs ra rb 539 1))
 
-;; shift right algebraic doubleword immediate
-(define-instruction sradi (ra rs sh)
-  (xs-form 31 rs ra sh 413 0))
+;; ;; shift right algebraic doubleword immediate
+;; (define-instruction sradi (ra rs sh)
+;;   (xs-form 31 rs ra sh 413 0))
 
-(define-instruction sradi. (ra rs sh)
-  (xs-form 31 rs ra sh 413 1))
+;; (define-instruction sradi. (ra rs sh)
+;;   (xs-form 31 rs ra sh 413 1))
 
 ;; shift right algebraic doubleword
 (define-instruction srad (ra rs rb)
@@ -1235,12 +1235,12 @@
 (define-instruction srad. (ra rs rb)
   (x-form 31 rs ra rb 794 1))
 
-;; extend-sign word and shift left immediate
-(define-instruction extswsli (ra rs sh)
-  (xs-form 31 rs ra sh 445 0))
+;; ;; extend-sign word and shift left immediate
+;; (define-instruction extswsli (ra rs sh)
+;;   (xs-form 31 rs ra sh 445 0))
 
-(define-instruction extswsli. (ra rs sh)
-  (xs-form 31 rs ra sh 445 1))
+;; (define-instruction extswsli. (ra rs sh)
+;;   (xs-form 31 rs ra sh 445 1))
 
 ;; convert declets to binary coded decimal
 (define-instruction cdtbcd (ra rs)
@@ -1328,7 +1328,7 @@
 
 ;; load floating-point single
 (define-instruction lfs (frt d ra)
-  (d-form 48 rt ra d))
+  (d-form 48 frt ra d))
 
 ;; load floating-point single indexed
 (define-instruction lfsx (frt ra rb)
@@ -1336,7 +1336,7 @@
 
 ;; load floating-point single with update
 (define-instruction lfsu (frt d ra)
-  (d-form 49 rt ra d))
+  (d-form 49 frt ra d))
 
 ;; load floating-point single with update indexed
 (define-instruction lfsux (frt ra rb)
@@ -1344,7 +1344,7 @@
 
 ;; load floating-point double
 (define-instruction lfd (frt d ra)
-  (d-form  rt ra d))
+  (d-form 50 frt ra d))
 
 ;; load floating-point double indexed
 (define-instruction lfdx (frt ra rb)
@@ -1352,7 +1352,7 @@
 
 ;; load floating-point double with update
 (define-instruction lfdu (frt d ra)
-  (d-form 51 rt ra d))
+  (d-form 51 frt ra d))
 
 ;; load floating-point double with update indexed
 (define-instruction lfdux (frt ra rb)
@@ -1372,7 +1372,7 @@
 
 ;; store floating-point single with update
 (define-instruction stfsu (frs d ra)
-  (d-form 53 rt ra d))
+  (d-form 53 frs ra d))
 
 ;; store floating-point single indexed
 (define-instruction stfsx (frs ra rb)
@@ -1384,11 +1384,11 @@
 
 ;; store floating-point double
 (define-instruction stfd (frs d ra)
-  (d-form 54 rt ra d))
+  (d-form 54 frs ra d))
 
 ;; store floating-point double with update
 (define-instruction stfdu (frs d ra)
-  (d-form 55 rt ra d))
+  (d-form 55 frs ra d))
 
 ;; store floating-point double indexed
 (define-instruction stfdx (frs ra rb)
@@ -1715,7 +1715,7 @@
   (x-form 63 frt 0 frb 424 0))
 
 (define-instruction friz. (frt frb)
-  (x-form 63 frt 0 frb 424  1))
+  (x-form 63 frt 0 frb 424 1))
 
 ;; floating round to integer plus
 (define-instruction frip (frt frb)
@@ -1741,10 +1741,10 @@
 
 ;; floating select
 (define-instruction fsel (frt fra frc frb)
-  (a-form frt fra frb frc 23 0))
+  (a-form 63 frt fra frb frc 23 0))
 
 (define-instruction fsel. (frt fra frc frb)
-  (a-form frt fra frb frc 23 1))
+  (a-form 63 frt fra frb frc 23 1))
 
 ;; Move From FPSCR [& Clear Enables | Lightweight | Control [& Set (DRN|RN)[Immediate]]] X-form
 (define-instruction mffs (frt)
@@ -1906,16 +1906,16 @@
 
 ;; dfp quantize immediate [quad]
 (define-instruction dquai (te frt frb rmc)
-  (z23-form frt te frb rmc 67 0))
+  (z23-form 59 frt te frb rmc 67 0))
 
 (define-instruction dquai. (te frt frb rmc)
-  (z23-form frt te frb rmc 67 1))
+  (z23-form 59 frt te frb rmc 67 1))
 
 (define-instruction dquaiq (te frtp frbp rmc)
-  (z23-form frtp te frbp rmc 67 0))
+  (z23-form 63 frtp te frbp rmc 67 0))
 
 (define-instruction dquaiq. (te frtp frbp rmc)
-  (z23-form frtp te frbp rmc 67 1))
+  (z23-form 63 frtp te frbp rmc 67 1))
 
 ;; dfp quantize [quad]
 (define-instruction dqua (frt fra frb rmc)
@@ -2340,7 +2340,7 @@
 
 ;; vector extract unsigned halfword
 (define-instruction vextractuh (vrt vrb uim)
-  (vx-form vrt uim vrb 589))
+  (vx-form 4 vrt uim vrb 589))
 
 ;; vector extract doubleword
 (define-instruction vextractd (vrt vrb uim)
@@ -2787,10 +2787,10 @@
 
 ;; vector compare greater than unsigned doubleword
 (define-instruction vcmpgtud (vrt vra vrb)
-  (vx-form 4 vrt vra vrb 0 711))
+  (vx-form 4 vrt vra vrb (logior (ash 0 10) 711)))
 
 (define-instruction vcmpgtud. (vrt vra vrb)
-  (vx-form 4 vrt vra vrb 1 711))
+  (vx-form 4 vrt vra vrb (logior (ash 1 10) 711)))
 
 ;; vector compare greater than unsigned halfword
 (define-instruction vcmpgtuh (vrt vra vrb)
