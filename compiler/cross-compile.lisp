@@ -653,7 +653,8 @@
   (save-integer sys.int::*llf-version* output-stream)
   (save-integer (ecase *target-architecture*
                   (:x86-64 sys.int::+llf-arch-x86-64+)
-                  (:arm64 sys.int::+llf-arch-arm64+))
+                  (:arm64 sys.int::+llf-arch-arm64+)
+                  (:ppc64le sys.int::+llf-arch-ppc64le+))
                 output-stream))
 
 (defun save-integer (integer stream)
@@ -1172,7 +1173,9 @@
   (let* ((builtins (ecase target-architecture
                      (:x86-64 (mezzano.compiler.backend.x86-64::generate-builtin-functions))
                      #+(or)
-                     (:arm64 (mezzano.compiler.codegen.arm64:generate-builtin-functions))))
+                     (:arm64 (mezzano.compiler.codegen.arm64:generate-builtin-functions))
+                     #+(or)
+                     (:ppc64le (mezzano.compiler.codegen.ppc64le:generate-builtin-functions))))
          (*use-new-compiler* nil)
          (*target-architecture* target-architecture))
     (save-custom-compiled-file path

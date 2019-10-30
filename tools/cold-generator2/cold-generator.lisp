@@ -306,7 +306,7 @@
   (setf (env:cross-symbol-value environment 'sys.int::*cold-toplevel-forms*)
         (concatenate
          'vector
-         (load-compiler-builtins environment)
+         ;; (load-compiler-builtins environment)
          (load-source-files environment *supervisor-source-files* :eval t :wired t)
          (load-source-files environment *source-files* :eval t))))
 

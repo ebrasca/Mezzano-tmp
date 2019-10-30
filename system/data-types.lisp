@@ -295,6 +295,7 @@ reserved on the disk, but no specific block has been allocated.")
 
 (defconstant +llf-arch-x86-64+ 1)
 (defconstant +llf-arch-arm64+ 2)
+(defconstant +llf-arch-ppc64le+ 3)
 
 (defconstant +llf-end-of-load+               #xFF)
 (defconstant +llf-backlink+                  #x01)

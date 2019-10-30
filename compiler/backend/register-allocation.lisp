@@ -766,6 +766,12 @@
               (setf (mezzano.compiler.backend.arm64::arm64-branch-true-target terminator) l))
              (t
               (setf (mezzano.compiler.backend.arm64::arm64-branch-false-target terminator) l)))
+       (ir:insert-before backend-function target l))
+      (mezzano.compiler.backend.ppc64le::ppc64le-branch-instruction
+       (cond ((eql (mezzano.compiler.backend.ppc64le::ppc64le-branch-true-target terminator) target)
+              (setf (mezzano.compiler.backend.ppc64le::ppc64le-branch-true-target terminator) l))
+             (t
+              (setf (mezzano.compiler.backend.ppc64le::ppc64le-branch-false-target terminator) l)))
        (ir:insert-before backend-function target l)))
     (ir:insert-after backend-function l (make-instance 'ir:jump-instruction :target target :values '()))
     l))

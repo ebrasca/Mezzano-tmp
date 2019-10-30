@@ -45,6 +45,7 @@ be generated instead.")
 (defclass target () ())
 (defclass x86-64-target (target) ())
 (defclass arm64-target (target) ())
+(defclass ppc64le-target (target) ())
 
 (defun canonicalize-target (target)
   (when (typep target 'target)
@@ -52,12 +53,14 @@ be generated instead.")
       target))
   (ecase (default-architecture target)
     (:x86-64 (make-instance 'x86-64-target))
-    (:arm64 (make-instance 'arm64-target))))
+    (:arm64 (make-instance 'arm64-target))
+    (:ppc64le (make-instance 'ppc64le-target))))
 
 (defun default-architecture (architecture)
   (or architecture
       #+x86-64 :x86-64
-      #+arm64 :arm64))
+      #+arm64 :arm64
+      #+ppc64le :ppc64le))
 
 (defun compile-lambda (lambda &optional env target-architecture)
   (let ((*print-readably* nil))

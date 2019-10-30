@@ -19,6 +19,7 @@
            #:target
            #:x86-64-target
            #:arm64-target
+           #:ppc64le-target
 
            #:quoted-form-p
            #:lambda-information
@@ -705,6 +706,12 @@
 (defpackage :mezzano.compiler.backend.arm64
   (:use :cl)
   (:local-nicknames (:lap :mezzano.lap.arm64)
+                    (:ir :mezzano.compiler.backend)
+                    (:ra :mezzano.compiler.backend.register-allocator)))
+
+(defpackage :mezzano.compiler.backend.ppc64le
+  (:use :cl)
+  (:local-nicknames (:lap :mezzano.lap.ppc64le)
                     (:ir :mezzano.compiler.backend)
                     (:ra :mezzano.compiler.backend.register-allocator)))
 
