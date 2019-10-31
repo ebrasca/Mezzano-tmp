@@ -32,13 +32,13 @@
   :gpr0)
 
 (defmethod ra:target-funcall-register ((target sys.c:ppc64le-target))
-  :gpr5)
-
-(defmethod ra:target-fref-register ((target sys.c:ppc64le-target))
   :gpr6)
 
+(defmethod ra:target-fref-register ((target sys.c:ppc64le-target))
+  :gpr7)
+
 (defmethod ra:target-count-register ((target sys.c:ppc64le-target))
-  :cr)
+  :gpr5)
 
 (defmethod ra:valid-physical-registers-for-kind ((kind (eql :value)) (architecture sys.c:ppc64le-target))
   '(:gpr0 :gpr1 :gpr2 :gpr3 :gpr4 :gpr6 :gpr7))
