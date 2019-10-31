@@ -4,8 +4,7 @@
 (in-package :mezzano.compiler.backend.ppc64le)
 
 (defmethod ra:architectural-physical-registers ((architecture sys.c:ppc64le-target))
-  '(:cr :lr :ctr :xer :vrsave :fpscr :vscr
-    :gpr0 :gpr1 :gpr2 :gpr3 :gpr4 :gpr5 :gpr6 :gpr7
+  '(:gpr0 :gpr1 :gpr2 :gpr3 :gpr4 :gpr5 :gpr6 :gpr7
     :gpr8 :gpr9 :gpr10 :gpr11 :gpr12 :gpr13 :gpr14 :gpr15
     :gpr16 :gpr17 :gpr18 :gpr19 :gpr20 :gpr21 :gpr22 :gpr23
     :gpr24 :gpr25 :gpr26 :gpr27 :gpr28 :gpr29 :gpr30 :gpr31
