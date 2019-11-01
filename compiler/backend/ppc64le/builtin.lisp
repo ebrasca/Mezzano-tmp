@@ -4,7 +4,7 @@
 (in-package :mezzano.compiler.backend.ppc64le)
 
 (defmacro define-builtin (name (lambda-list results) &body body)
-  (when (not (listp results))
+  (unless (listp results)
     (setf results (list results)))
   (let ((backend-function (gensym))
         (insertion-point (gensym))
@@ -26,7 +26,7 @@
                                                         (typep (first arg-defs) 'ir:constant-instruction))
                                                    (ir:constant-value (first arg-defs)))
                                                   (t (give-up))))))
-                               (when (not ,predicate)
+                               (unless ,predicate
                                  (give-up))
                                ,@body)))))
     `(%defbuiltin ',name
@@ -75,15 +75,15 @@
 (defun consumed-by-p (definition consumer uses defs)
   "Return true if all DEFINITION's outputs are only used by CONSUMER."
   (dolist (out (ir:instruction-outputs definition)
-           t)
+               t)
     (when (typep out 'ir:virtual-register)
       (let ((out-defs (gethash out defs))
             (out-uses (gethash out uses)))
         ;; (format t "Out: ~S  defs: ~S  uses: ~S~%" out out-defs out-uses)
         ;; Must have one definition.
-        (when (not (and out-defs
-                        (eql (first out-defs) definition)
-                        (endp (rest out-defs))))
+        (unless (and out-defs
+                     (eql (first out-defs) definition)
+                     (endp (rest out-defs)))
           (return nil))
         ;; Must be used only by the consumer.
         (when (or (endp out-uses)
@@ -116,10 +116,10 @@
                    ;; FIXME: This should work when the result consumed by the branch is a predicate and other results are ignored.
                    (eql (length (builtin-result-list builtin)) 1)
                    (keywordp (first (builtin-result-list builtin))))
-          (when (not (apply (builtin-generator builtin)
-                            backend-function inst
-                            defs
-                            (ir:call-arguments inst)))
+          (unless (apply (builtin-generator builtin)
+                         backend-function inst
+                         defs
+                         (ir:call-arguments inst))
             (return-from lower-predicate-builtin nil))
           (let ((pred (first (builtin-result-list builtin))))
             (ir:insert-before
@@ -143,22 +143,19 @@
     (when builtin
       (let* ((result-regs (if (typep inst 'ir:call-instruction)
                               (list* (ir:call-result inst)
-                                     (loop
-                                       for r in (rest (builtin-result-list builtin))
-                                       collect (make-instance 'ir:virtual-register)))
-                              (loop
-                                for r in (builtin-result-list builtin)
-                                collect (make-instance 'ir:virtual-register))))
-             (results (loop
-                        for result in (builtin-result-list builtin)
-                        for reg in result-regs
-                        when (not (keywordp result))
-                        collect reg)))
-        (when (not (apply (builtin-generator builtin)
-                          backend-function inst
-                          defs
-                          (append (ir:call-arguments inst)
-                                  results)))
+                                     (loop :for r :in (rest (builtin-result-list builtin))
+                                           :collect (make-instance 'ir:virtual-register)))
+                              (loop :for r :in (builtin-result-list builtin)
+                                    :collect (make-instance 'ir:virtual-register))))
+             (results (loop :for result :in (builtin-result-list builtin)
+                            :for reg :in result-regs
+                            :when (not (keywordp result))
+                            :collect reg)))
+        (unless (apply (builtin-generator builtin)
+                       backend-function inst
+                       defs
+                       (append (ir:call-arguments inst)
+                               results))
           (return-from lower-builtin nil))
         (cond ((and result-regs
                     (endp (builtin-result-list builtin)))
@@ -172,14 +169,13 @@
                                  :value nil))))
               (t
                ;; Convert predicate results to NIL/T.
-               (loop
-                 for result in (builtin-result-list builtin)
-                 for reg in result-regs
-                 when (keywordp result)
-                 do (reify-predicate result reg
-                                     (lambda (new-inst)
-                                       (ir:insert-before
-                                        backend-function inst new-inst))))))
+               (loop :for result :in (builtin-result-list builtin)
+                     :for reg :in result-regs
+                     :when (keywordp result)
+                     :do (reify-predicate result reg
+                                          (lambda (new-inst)
+                                            (ir:insert-before
+                                             backend-function inst new-inst))))))
         ;; Fix up multiple values.
         (when (typep inst 'ir:call-multiple-instruction)
           (ir:insert-before
