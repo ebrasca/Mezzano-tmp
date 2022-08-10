@@ -247,6 +247,10 @@
 (defun 82540em-reset (nic)
   ;; Mask interrupts.
   (setf (82540em-reg/32 nic +IMC+) #xFFFF)
+  ;; Issue a Global Reset
+  (setf (ldb (byte 1 26) (82540em-reg/32 nic +CTRL+)) 1) ; Reset bit
+  ;; Mask interrupts.
+  (setf (82540em-reg/32 nic +IMC+) #xFFFF)
   ;; Disables interrupt throttling logic
   (setf (82540em-reg/32 nic +ITR+) 0)
   ;; Disable tx and rx.
