@@ -247,10 +247,8 @@
 (defun 82540em-reset (nic)
   ;; Mask interrupts.
   (setf (82540em-reg/32 nic +IMC+) #xFFFF)
-  ;; Set the interrupt treshold reg max 10k irqs/sec.
-  (let ((irq-rate 10000))
-    (setf (82540em-reg/32 nic +ITR+)
-          (* 4 (/ 1000000 irq-rate))))
+  ;; Disables interrupt throttling logic
+  (setf (82540em-reg/32 nic +ITR+) 0)
   ;; Disable tx and rx.
   (setf (82540em-reg/32 nic +RCTL+) 0
         (82540em-reg/32 nic +TCTL+) 0)
