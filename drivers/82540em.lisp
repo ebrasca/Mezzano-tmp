@@ -251,6 +251,10 @@
   (setf (ldb (byte 1 26) (82540em-reg/32 nic +CTRL+)) 1) ; Reset bit
   ;; Mask interrupts.
   (setf (82540em-reg/32 nic +IMC+) #xFFFF)
+  ;; Not using XOFF flow control
+  (setf (82540em-reg/32 nic +FCAL+) 0
+        (82540em-reg/32 nic +FCAH+) 0
+        (82540em-reg/32 nic +FCT+) 0)
   ;; Disables interrupt throttling logic
   (setf (82540em-reg/32 nic +ITR+) 0)
   ;; Disable tx and rx.
