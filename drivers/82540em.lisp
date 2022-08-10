@@ -12,7 +12,7 @@
 (in-package :mezzano.driver.82540em)
 
 ;;; Registers.
-;; general
+;; General.
 (defconstant +CTRL+    #x000 "Device Control")
 (defconstant +STATUS+  #x008 "Device Status")
 (defconstant +EEC+     #x010 "EEPROM/Flash Control")
@@ -29,14 +29,14 @@
 (defconstant +RXCW+    #x180 "Receive Configuration Word")
 (defconstant +LEDCTL+  #xE00 "LED Control")
 
-;; interrupt
+;; Interrupt.
 (defconstant +ICR+   #x00C0 "Interrupt Cause Read")
 (defconstant +ITR+   #x00c4 "Interrupt Throttling Rate")
 (defconstant +IMS+   #x00d0 "Interrupt Mask Set/Read")
 (defconstant +IMC+   #x00d8 "Interrupt Mask Set/Read")
 (defconstant +IAM+   #x00e0 "Interrupt Acknowledge Auto Mask")
 
-;; receive
+;; Receive.
 (defconstant +RCTL+  #x0100 "Receive Control")
 (defconstant +FCRTL+ #x2160 "Flow Control Receive Threshold Low")
 (defconstant +FCRTH+ #x2168 "Flow Control Receive Threshold High")
@@ -49,7 +49,7 @@
 (defconstant +RADV+  #x282C "Receive Interrupt Absolute Delay Timer")
 (defconstant +RSRPD+ #x2C00 "Receive Small Packet Detect")
 
-;; transmit
+;; Transmit.
 (defconstant +TCTL+  #x0400 "Transmit Control")
 (defconstant +TIPG+  #x0410 "Transmit IPG")
 (defconstant +TDBAL+ #x3800 "Transmit Descriptor Base Low")
@@ -85,7 +85,7 @@
    (%rx-bounce-phys :initarg :rx-bounce-phys :accessor 82540em-rx-bounce-phys)
    (%rx-bounce-virt :initarg :rx-bounce-virt :accessor 82540em-rx-bounce-virt)
    (%rx-current :initarg :rx-current :accessor 82540em-rx-current)
-   ;; Stats
+   ;; Stats.
    (%rx-octets :initform 0 :accessor 82540em-rx-octets)
    (%rx-count :initform 0 :accessor 82540em-rx-count)
    (%tx-octets :initform 0 :accessor 82540em-tx-octets)
@@ -152,7 +152,7 @@
 (defun tx-descriptors-available-p (nic)
   (/= (82540em-tx-used-count nic) +82540em-n-tx-descriptors+))
 
-;; TODO
+;; TODO.
 (defun dump (nic)
   (describe nic))
 
@@ -206,20 +206,20 @@
         (82540em-reg/32 nic +RDBAL+) (logior (82540em-rx-ring-phys nic) #xFFFFFFFF)
         (82540em-reg/32 nic +RDBAH+) (ash (82540em-rx-ring-phys nic) -32)
         (82540em-reg/32 nic +RDLEN+) (* +82540em-n-rx-descriptors+ +82540em-descriptor-size+)
-        ;; Set head and tail to 0
+        ;; Set head and tail to 0.
         (82540em-reg/32 nic +RDH+) 0
         (82540em-reg/32 nic +RDT+) 0
-        ;; Disable receive delay timer and absolute delay timer
+        ;; Disable receive delay timer and absolute delay timer.
         (82540em-reg/32 nic +RDTR+) 0
         (82540em-reg/32 nic +RADV+) 0
-        ;; Disable small packet detect
+        ;; Disable small packet detect.
         (82540em-reg/32 nic +RSRPD+) 0)
-  ;; TODO: Make the magic numbers into defcontants
   ;; Start receiver
   (setf (82540em-reg/32 nic +RCTL+)
-        (logior (ash 1 1)     ; RX
+        (logior (ash 1 1)     ; RX enable
                 (ash 1 3)     ; Unicast permiscuous
                 (ash 1 4)     ; Multicast permiscuous
+                (ash 0 10)    ; Use legacy description type
                 (ash 1 15)    ; Broadcast accept
                 (ash 0 16)))) ; BSIZE 2048
 
@@ -236,42 +236,40 @@
         (82540em-reg/32 nic +TDBAL+) (logior (82540em-tx-ring-phys nic) #xFFFFFFFF)
         (82540em-reg/32 nic +TDBAH+) (ash (82540em-tx-ring-phys nic) -32)
         (82540em-reg/32 nic +TDLEN+) (* +82540em-n-tx-descriptors+ +82540em-descriptor-size+)
-        ;; Set head and tail to 0
+        ;; Set head and tail to 0.
         (82540em-reg/32 nic +TDH+) 0
         (82540em-reg/32 nic +TDT+) 0)
-  ;; TODO: Make the magic numbers into defcontants
-  ;; Start transmitter
+  ;; Start transmitter.
   (setf (82540em-reg/32 nic +TCTL+)
-        (logior (ash 1 3)    ; short packet pad
-                (ash 1 1)))) ; tx enable
+        (logior (ash 1 1)    ; TX enable
+                (ash 1 3)))) ; Short packet pad
 
 (defun 82540em-reset (nic)
   ;; Mask interrupts.
   (setf (82540em-reg/32 nic +IMC+) #xFFFF)
-  ;; Set the interrupt treshold reg max 10k irqs/sec
+  ;; Set the interrupt treshold reg max 10k irqs/sec.
   (let ((irq-rate 10000))
     (setf (82540em-reg/32 nic +ITR+)
           (* 4 (/ 1000000 irq-rate))))
-  ;; Disable tx and rx
+  ;; Disable tx and rx.
   (setf (82540em-reg/32 nic +RCTL+) 0
         (82540em-reg/32 nic +TCTL+) 0)
-  ;; Set up the flow control thresholds
+  ;; Set up the flow control thresholds.
   (setf (82540em-reg/32 nic +FCRTL+) 0
         (82540em-reg/32 nic +FCRTH+) 0)
-  ;; Reset rings
+  ;; Reset rings.
   (reset-rx-ring nic)
   (reset-tx-ring nic)
-  ;; TODO: Make the magic numbers into defcontants
-  ;; Unmask rx irq
+  ;; Unmask rx irq.
   (setf (82540em-reg/32 nic +IMS+)
         (logior (82540em-reg/32 nic +IMS+)
                 (ash 1 7)   ; RXO
                 (ash 1 6))) ; RXTO
-  ;; Unmask tx irq
+  ;; Unmask tx irq.
   (setf (82540em-reg/32 nic +IMS+)
         (logior (82540em-reg/32 nic +IMS+)
-                (ash 1 1)   ; transmit queue empty
-                (ash 1 0))) ; tx descriptor write back
+                (ash 1 0)   ; TX descriptor write back
+                (ash 1 1))) ; Transmit queue empty
   t)
 
 (defun 82540em-initialize (nic)
@@ -297,7 +295,7 @@
     (setf (values (82540em-rx-ring-phys nic)
                   (82540em-rx-ring-virt nic))
           (82540em-allocate-ring "RX" +82540em-n-rx-descriptors+))
-    ;; And TX & RX bounce buffers.
+    ;; Allocate TX & RX bounce buffers.
     (setf (values (82540em-tx-bounce-phys nic)
                   (82540em-tx-bounce-virt nic))
           (82540em-allocate-bounce "TX" +82540em-n-tx-descriptors+))
@@ -342,7 +340,7 @@
                   (setf (82540em-reg/32 nic +RDT+) current)
                   ;; Advance Current.
                   (setf (82540em-rx-current nic) (rem (1+ current) +82540em-n-rx-descriptors+))
-                  ;; Update statistics
+                  ;; Update statistics.
                   (incf (82540em-rx-octets nic) frame-len)
                   (incf (82540em-rx-count nic))))
               (nic:device-received-packet nic buffer))))
@@ -374,7 +372,7 @@
               (let ((descriptor 0))
                 (setf (ldb (byte 16  0) descriptor) (min +82540em-mtu+ (length to-send))
                       (ldb (byte  8 16) descriptor) 0
-                      (ldb (byte  8 24) descriptor) (ash 1 0) ; end of packet (EOP)
+                      (ldb (byte  8 24) descriptor) (ash 1 0) ; End of packet (EOP)
                       (ldb (byte  8 32) descriptor) 0
                       (ldb (byte  8 40) descriptor) 0
                       (ldb (byte 16 48) descriptor) 0)
@@ -384,7 +382,7 @@
               (setf (82540em-reg/32 nic +TDT+) current)
               ;; Advance current.
               (setf (82540em-tx-current nic) (rem (1+ current) +82540em-n-tx-descriptors+))
-              ;; Update statistics
+              ;; Update statistics.
               (incf (82540em-tx-octets nic) (length to-send))
               (incf (82540em-tx-count nic))
               (incf (82540em-tx-used-count nic)))))
