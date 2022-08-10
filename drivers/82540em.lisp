@@ -59,7 +59,7 @@
 (defconstant +TDT+   #x3818 "Transmit Descriptor Tail")
 (defconstant +TIDV+  #x3820 "Transmit Interrupt Delay Value")
 
-(defconstant +82540em-mtu+ 1500 "Valid values are 1500, 4010, 8106, 16298")
+(defconstant +82540em-mtu+ 2048)
 (defconstant +82540em-descriptor-size+ 16)
 (defconstant +82540em-n-tx-descriptors+ 128 "Valid values are 80–4096")
 (defconstant +82540em-n-rx-descriptors+ 128 "Valid values are 80–4096")
